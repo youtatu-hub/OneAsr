@@ -1,0 +1,68 @@
+//! OneAsr core: Qwen ASR + ForcedAligner pipeline, sentence boundary, subtitles.
+//!
+//! This crate is headless by design: it holds no window and no list model. The
+//! batch list (`Task` / `TaskStatus`) and the interface labels live in the GUI
+//! crate; the bilingual copy for messages that *originate* here (errors, stage
+//! names, download progress, stats spans) lives in [`i18n`], together with the
+//! shared zh/en language mechanism the GUI crate reuses.
+
+pub mod asr;
+mod diagnostics;
+pub mod engine;
+pub mod hotword;
+pub mod i18n;
+pub mod lang;
+pub mod media;
+pub mod model;
+pub mod paths;
+pub mod runtime;
+pub mod sentence_boundary;
+pub mod settings;
+pub mod stats;
+pub mod subtitle;
+pub mod text_decode;
+pub mod text_script;
+pub mod timeline;
+pub mod transcript;
+pub mod txt;
+pub mod vad;
+
+pub use asr::{
+    AsrStage, ProcessExportOptions, StageClock, StageTiming, StageUpdate, TaskTiming,
+    TranscriptInput, check_aligner_model_dir, check_asr_model_dir, check_demucs_model_dir,
+    check_sensevoice_model_dir, format_process_ms, invalidate_all_model_checks,
+    invalidate_model_check, is_model_ready, needs_alignment, process_media_file_with_export,
+    process_media_file_with_progress, process_media_file_with_provider,
+    process_media_file_with_transcript, process_media_file_with_transcript_export,
+};
+pub use diagnostics::take_trace;
+pub use engine::{
+    AlignRequest, AlignedToken, Aligner, AsrEngine, EngineError, EngineProvider, SeparateRequest,
+    SeparationEvent, Separator, TranscribeRequest, Transcript,
+};
+pub use hotword::{DEFAULT_HOTWORD_GROUP_ID, GroupLookup, HotwordGroup, HotwordRun, HotwordStore};
+pub use lang::{
+    SOURCE_LANGUAGES, SourceLanguage, normalize_source_language, source_language_by_id,
+};
+pub use media::{
+    AUDIO_EXTS, FfmpegSource, MediaKind, VIDEO_EXTS, ffmpeg_source, is_audio_ext, is_video_ext,
+    media_kind, probe_duration_async, probe_duration_sec, resolve_app_root, supported_exts,
+};
+pub use model::{
+    DownloadHandle, DownloadOutcome, DownloadProgress, DownloadState, HTDEMUCS_FT, ModelId,
+    ModelKind, QWEN3_ASR_06B, QWEN3_ASR_17B, SENSEVOICE_SMALL, default_aligner_model_dir,
+    default_asr_model_dir, default_demucs_model_dir, default_sensevoice_model_dir, download_model,
+    probe_writable, resolve_app_root_dir, resolve_models_root,
+};
+pub use paths::{
+    DataEnv, DataRoot, DataRootError, DataRootSource, Platform, data_dir, data_root,
+    data_root_log_line, default_output_dir, hotwords_path, install_settings_path, redact_home,
+    resolve_data_root, runs_dir, set_data_root_override, settings_path, user_data_base,
+};
+pub use runtime::{demote_current_thread, init_runtime};
+pub use settings::{
+    CHUNK_TARGET_DEFAULT_SEC, CHUNK_TARGET_MAX_SEC, CHUNK_TARGET_MIN_SEC, CHUNK_TARGET_PRESETS,
+    Settings, SettingsLoadReport, clamp_chunk_target_seconds,
+};
+pub use text_script::{TextScript, applies_to_language as script_applies_to_language};
+pub use timeline::{Cue, RenderOptions, Rendered, Timeline, TimelineWord, read_timeline, render};

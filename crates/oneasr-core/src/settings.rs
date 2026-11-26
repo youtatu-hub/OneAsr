@@ -1,0 +1,2136 @@
+//! The persisted settings model: what the app remembers between runs, how the
+//! values are clamped, and how a damaged file is repaired rather than dropped.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use crate::i18n;
+use crate::lang::{default_source_language, normalize_source_language};
+use crate::model::{
+    ModelId, ModelKind, OMNI_ASR_CTC_300M, QWEN_ALIGN_LEGACY, QWEN_ALIGN_ULTRA, QWEN3_ASR_06B,
+    default_aligner_model_dir, default_asr_model_dir, resolve_model_dir,
+};
+use crate::paths;
+use crate::text_script::{self, TextScript};
+
+/// Inclusive lower bound for VAD ASR chunk target (seconds).
+pub const CHUNK_TARGET_MIN_SEC: u32 = 30;
+/// Inclusive upper bound for VAD ASR chunk target (seconds).
+pub const CHUNK_TARGET_MAX_SEC: u32 = 180;
+/// Product default when settings omit `chunk_target_seconds`.
+pub const CHUNK_TARGET_DEFAULT_SEC: u32 = 60;
+/// Settings UI preset values (seconds), all within
+/// [`CHUNK_TARGET_MIN_SEC`]..=[`CHUNK_TARGET_MAX_SEC`].
+pub const CHUNK_TARGET_PRESETS: &[(u32, &str)] = &[
+    (30, "30"),
+    (60, "60"),
+    (90, "90"),
+    (120, "120"),
+    (180, "180"),
+];
+
+/// Clamp a chunk target into the legal product range.
+#[inline]
+pub fn clamp_chunk_target_seconds(value: u32) -> u32 {
+    value.clamp(CHUNK_TARGET_MIN_SEC, CHUNK_TARGET_MAX_SEC)
+}
+
+/// User-facing settings for the Qwen ASR + ForcedAligner pipeline.
+///
+/// Persisted as `{data}/settings.json` — the data directory (`crate::paths`),
+/// which is the install directory in the portable layout and the platform user
+/// directory when the install directory is read-only.
+///
+/// # ASR selection model
+/// - [`Self::asr_model`] is the **active** catalog id (`Qwen3-ASR-0.6B-hf` | `1.7B-hf`).
+/// - [`Self::asr_model_dir`] is the path loaded at runtime — always
+///   [`Self::asr_dir_for`] of the active size, never stored twice.
+/// - A size's directory is either a hand-picked folder (stored **verbatim** in
+///   [`Self::asr_dirs`]) or, when nothing was picked for that size, the
+///   install layout `{app}/models/{name}`. Nothing else ever resolves a path.
+/// - Completing a download for a **non-selected** size only installs files on
+///   disk; it must not change the active selection (see
+///   [`Self::bind_download_if_active`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Settings {
+    /// Active ASR catalog id (`Qwen3-ASR-0.6B-hf` | `Qwen3-ASR-1.7B-hf`).
+    #[serde(default = "default_asr_model")]
+    pub asr_model: String,
+    /// Directory loaded for inference (install layout or user-picked).
+    #[serde(default = "default_asr_model_dir")]
+    pub asr_model_dir: PathBuf,
+
+    /// Per-size ASR directories, keyed by catalog id (`Qwen3-ASR-0.6B-hf` …).
+    ///
+    /// ASR has one directory per **size**, stored exactly as the user picked
+    /// it — what you select is what that size loads. A size with no entry
+    /// falls back to the install layout. Only deliberate choices live here:
+    /// the install-layout default is recomputed from the app location on
+    /// every read, and storing it would pin this machine's absolute path
+    /// into the config (and break a moved app).
+    #[serde(default)]
+    pub asr_dirs: BTreeMap<String, PathBuf>,
+    /// Active aligner catalog id (`Qwen3-ForcedAligner-Ultra` |
+    /// `omniASR-CTC-300M-v2-hf`). The pre-Ultra `Qwen3-ForcedAligner-0.6B-hf`
+    /// string is accepted and canonicalized. Empty = unset (first run):
+    /// normalize decides — Qwen unless only CTC is on disk — and persists it.
+    #[serde(default)]
+    pub aligner_model: String,
+    /// Directory loaded for the aligner (install layout or user-picked).
+    #[serde(default = "default_aligner_model_dir")]
+    pub aligner_model_dir: PathBuf,
+    /// Per-aligner-model directories, keyed by catalog id — same per-model
+    /// memory as [`Self::asr_dirs`]; only deliberate picks live here.
+    #[serde(default)]
+    pub aligner_dirs: BTreeMap<String, PathBuf>,
+    /// `auto` | `gpu` | `cpu`
+    #[serde(default = "default_backend")]
+    pub backend: String,
+    #[serde(default = "default_max_new_tokens")]
+    pub max_new_tokens: usize,
+    /// Default source language for **new** tasks (`zh`, `en`, …).
+    /// Each task can override; pipeline uses the task language at run time.
+    #[serde(default = "default_source_language")]
+    pub language: String,
+    /// Interface language: `system` (follow the OS) | `zh` | `en`.
+    /// Normalized by [`i18n::normalize_ui_language`]; resolved to a concrete
+    /// [`i18n::UiLang`] by [`Self::resolved_ui_language`].
+    #[serde(default = "default_ui_language")]
+    pub ui_language: String,
+    /// `short` | `standard` | `loose`
+    #[serde(default = "default_subtitle_length_preset")]
+    pub subtitle_length_preset: String,
+    /// VAD ASR chunk target seconds
+    /// ([`CHUNK_TARGET_MIN_SEC`]..=[`CHUNK_TARGET_MAX_SEC`]; default
+    /// [`CHUNK_TARGET_DEFAULT_SEC`]).
+    #[serde(default = "default_chunk_target_seconds")]
+    pub chunk_target_seconds: u32,
+    /// Directory for finished `.srt` files. Default: `{data}/output`.
+    #[serde(default = "default_output_dir")]
+    pub output_dir: PathBuf,
+    /// `true` → SRT saved next to the source media file; `output_dir` is the
+    /// fallback when that directory is not writable (or has no parent dir).
+    #[serde(default = "default_save_next_to_source")]
+    pub save_next_to_source: bool,
+    /// Write finished `.srt` files. At least one of SRT / TXT stays on.
+    #[serde(default = "default_output_srt")]
+    pub output_srt: bool,
+    /// Write a plain-text `.txt` transcript: one sentence per line, split on
+    /// sentence punctuation. Never derived from the subtitle timeline — see
+    /// [`crate::txt`].
+    #[serde(default)]
+    pub output_txt: bool,
+    /// Write a karaoke `.ass`: the same cues, a colour sweep per aligned unit.
+    #[serde(default)]
+    pub output_ass: bool,
+    /// 成稿字幕美化。默认关。不看语言选项，按每一句字幕自己的字符处理标点、
+    /// 全角半角，以及汉字和英文、数字之间的空格。不重新断行。
+    #[serde(default)]
+    pub subtitle_beautify: bool,
+    /// Chinese output script: `simplified` (default) | `traditional`.
+    /// Applies to `zh` / `yue` sources; other languages ignore it.
+    #[serde(default = "default_text_script")]
+    pub text_script: String,
+    /// Run HTDemucs vocal separation before VAD/ASR (needs Demucs weights).
+    #[serde(default)]
+    pub vocal_separation: bool,
+    /// HTDemucs weights directory (default `{app}/models/htdemucs_ft`).
+    #[serde(default = "default_demucs_model_dir")]
+    pub demucs_model_dir: PathBuf,
+    /// **本次运行**要用的热词（`None` = 不跑粗转）。
+    ///
+    /// 不落盘（`serde(skip)`）：它是**任务级**的运行时状态，与 `language` /
+    /// `vocal_separation` 同一套路——GUI 每次开跑前从任务上抄进这份副本，持久化
+    /// 的那份在 [`crate::hotword::HotwordStore`]（`hotword.json`）。
+    ///
+    /// 这里存的是**已经解析好的**词表文本与调参，不是组 id：管线因此拿不到悬空
+    /// id，「组被删了却仍按热词去要求粗转模型」那类自相矛盾从结构上消失。
+    #[serde(skip)]
+    pub hotword_run: Option<crate::hotword::HotwordRun>,
+    /// SenseVoiceSmall 目录（热词粗转用；默认 `{app}/models/SenseVoiceSmall`）。
+    #[serde(default = "default_sensevoice_model_dir")]
+    pub sensevoice_model_dir: PathBuf,
+    /// The one sound switch (「提示音」): interaction taps AND the run
+    /// reminder together.
+    #[serde(default = "default_sound")]
+    pub sound: bool,
+    /// 关窗行为开关：开 = 点窗口关闭按钮隐藏到托盘（任务继续，托盘/任务栏
+    /// 唤回）；关（默认）= 直接退出进程。托盘菜单「退出」不受它影响，总是
+    /// 真退出。
+    #[serde(default = "default_close_to_tray")]
+    pub close_to_tray: bool,
+    /// 首次启动欢迎卡是否已经看过（看过 = 永不再弹）。
+    ///
+    /// serde 字段默认是 `true`：老配置里没有这个字段，升级用户不该再看一遍
+    /// 欢迎卡。`false` 只会出现在 [`Self::default`] —— 也就是连 settings.json
+    /// 都不存在的全新安装上。首次关闭时由 GUI 立刻落盘，见 `oneasr` 的
+    /// `dismiss_welcome`。
+    #[serde(default = "default_welcome_done")]
+    pub welcome_done: bool,
+    /// Pre-0.2.0 switch, read-only and never written back: `ui_sound` merged
+    /// into [`Self::sound`], and an install that had muted either family must
+    /// not get sound back just because the field it turned off disappeared from
+    /// the schema. Absent (the common case) means "nothing to carry over".
+    #[serde(default, rename = "ui_sound", skip_serializing_if = "Option::is_none")]
+    pub legacy_ui_sound: Option<bool>,
+    /// Pre-0.2.0 switch, read-only — see [`Self::legacy_ui_sound`].
+    #[serde(
+        default,
+        rename = "task_notify",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub legacy_task_notify: Option<bool>,
+}
+
+fn default_asr_model() -> String {
+    QWEN3_ASR_06B.into()
+}
+
+fn default_backend() -> String {
+    "auto".into()
+}
+
+fn default_max_new_tokens() -> usize {
+    2048
+}
+
+fn default_ui_language() -> String {
+    // 跟随系统：zh 系统中文、其余英文；首次运行后用户可在设置里固定。
+    i18n::UI_LANGUAGE_SYSTEM.into()
+}
+
+fn default_subtitle_length_preset() -> String {
+    "standard".into()
+}
+
+fn default_chunk_target_seconds() -> u32 {
+    CHUNK_TARGET_DEFAULT_SEC
+}
+
+fn default_output_dir() -> PathBuf {
+    paths::default_output_dir()
+}
+
+fn default_save_next_to_source() -> bool {
+    true
+}
+
+fn default_output_srt() -> bool {
+    true
+}
+
+fn default_text_script() -> String {
+    // Product default: never re-write the recognizer's own script.
+    TextScript::ORIGINAL_ID.into()
+}
+
+fn default_demucs_model_dir() -> PathBuf {
+    crate::model::default_demucs_model_dir()
+}
+
+fn default_sensevoice_model_dir() -> PathBuf {
+    crate::model::default_sensevoice_model_dir()
+}
+
+// Sounds default on: that has been the shipped behaviour, and the one switch
+// to turn them all off lives in an obvious place.
+fn default_sound() -> bool {
+    true
+}
+
+/// `close_to_tray` 默认关：老用户的关窗语义不变（直接退出），要托盘的显式
+/// 打开一次开关。
+fn default_close_to_tray() -> bool {
+    false
+}
+
+// 欢迎卡只该出现在全新安装上：settings.json 缺这个字段（老配置）落 `true`
+// 不弹，[`Settings::default`]（全新安装的落点）才显式给 `false`。
+fn default_welcome_done() -> bool {
+    true
+}
+
+/// 选中的输出里有没有**带时间轴**的那一种（SRT / ASS）。
+///
+/// 这条判据全仓库只有这一处，三处都问它：
+/// - [`Settings::can_start`]：带时间轴才需要对齐器（TXT 走纯文本路，不需要权重）；
+/// - [`Settings::can_start_transcript`]：文稿匹配必须有带时间轴的产物——纯 TXT
+///   的匹配没有时间轴可言（管线的 TXT-only 文稿匹配同样被拒）；
+/// - CLI 的用法校验（`align --no-srt --txt`）：那是「用法错」，要在碰模型
+///   之前就报出来，不该等门禁。
+///
+/// 写成自由函数而不是方法：CLI 那时只有两个旗标，还没有一份 [`Settings`]。
+pub fn timed_output_selected(output_srt: bool, output_ass: bool) -> bool {
+    output_srt || output_ass
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            asr_model: default_asr_model(),
+            asr_model_dir: default_asr_model_dir(),
+            asr_dirs: BTreeMap::new(),
+            // 自洽：引擎 id 与目录指向同一个模型。留空会让 `selected_aligner_id()`
+            // 兜底成默认（Qwen）而目录还停在别处，于是「选了 Qwen 却往 CTC 目录加载/
+            // 下载」。磁盘上「只装了 CTC」的情况由 `load_with_report` 的兜底分支
+            // 过一遍 `normalize` 来决定，不靠这个默认值猜。
+            aligner_model: ModelId::default_aligner().as_str().to_string(),
+            aligner_model_dir: default_aligner_model_dir(),
+            aligner_dirs: BTreeMap::new(),
+            backend: default_backend(),
+            max_new_tokens: default_max_new_tokens(),
+            language: default_source_language(),
+            ui_language: default_ui_language(),
+            subtitle_length_preset: default_subtitle_length_preset(),
+            chunk_target_seconds: default_chunk_target_seconds(),
+            output_dir: default_output_dir(),
+            save_next_to_source: default_save_next_to_source(),
+            output_srt: default_output_srt(),
+            output_txt: false,
+            output_ass: false,
+            subtitle_beautify: false,
+            text_script: default_text_script(),
+            vocal_separation: false,
+            demucs_model_dir: default_demucs_model_dir(),
+            sensevoice_model_dir: default_sensevoice_model_dir(),
+            // 运行期状态：每次开跑由 GUI 从任务 + 热词库填进来，不落盘。
+            hotword_run: None,
+            sound: default_sound(),
+            close_to_tray: default_close_to_tray(),
+            // 全新安装要弹欢迎卡；serde 字段默认（老配置）是 true 不弹。
+            welcome_done: false,
+            legacy_ui_sound: None,
+            legacy_task_notify: None,
+        }
+    }
+}
+
+/// What [`Settings::load_with_report`] found on disk. The GUI logs it at startup,
+/// so a pasted `oneasr-error.log` explains fallback-to-defaults and the
+/// portable-move model-dir self-heal without guessing.
+#[derive(Debug, Default, Clone)]
+pub struct SettingsLoadReport {
+    /// `settings.json` 实际读到的那份（数据目录优先、安装目录兜底）；都没读到
+    /// 时是数据目录里的写路径。写入永远只走数据目录。
+    pub config_path: Option<PathBuf>,
+    /// **真的读到了**一份 settings.json（数据目录或安装目录）。
+    ///
+    /// 这不是诊断字段而是契约：CLI 的模型路径解析用它区分「用户配置了模型」
+    /// 与「一个都没有、按安装布局兜底」。没有它就只能靠目录是否为空来猜，
+    /// 而空目录恰好也是合法配置。
+    pub found: bool,
+    /// Non-NotFound read failure (permission, file lock, …).
+    pub read_error: Option<String>,
+    /// File exists but is not valid settings JSON.
+    pub parse_error: Option<String>,
+    /// Model-dir repairs applied by `normalize`, as `"old → new"` strings.
+    pub repairs: Vec<String>,
+}
+
+impl SettingsLoadReport {
+    /// True when something notable happened and deserves a log entry.
+    pub fn is_notable(&self) -> bool {
+        self.read_error.is_some() || self.parse_error.is_some() || !self.repairs.is_empty()
+    }
+}
+
+impl Settings {
+    /// `settings.json` 的**写**路径：数据目录里（`crate::paths`）。
+    ///
+    /// 数据目录解析不出来（既没有可写安装目录、也没有平台用户目录）时返回
+    /// `None`：那说明这台机器没有别的可写位置，[`Self::save`] 会给出清晰错误，
+    /// 而不是悄悄落进操作系统临时目录。
+    pub fn config_path() -> Option<PathBuf> {
+        crate::paths::data_root()
+            .is_ok()
+            .then(crate::paths::settings_path)
+    }
+
+    pub fn load() -> Self {
+        Self::load_with_report().0
+    }
+
+    /// Load + report why defaults were used, so the GUI can log it and a pasted
+    /// `oneasr-error.log` explains "my settings are gone" without guessing.
+    ///
+    /// **老数据不丢**：数据目录里的 `settings.json` 优先；读不到时（老用户升级
+    /// 前把配置写在了安装目录，或安装目录后来变只读）再兜底读安装目录里的那一份，
+    /// 不下沉到默认值。写入永远只走数据目录。
+    pub fn load_with_report() -> (Self, SettingsLoadReport) {
+        let mut report = SettingsLoadReport {
+            config_path: Self::config_path(),
+            ..SettingsLoadReport::default()
+        };
+        let candidates =
+            Self::read_candidates(&report.config_path, &paths::install_settings_path());
+        match Self::load_first_of(&candidates, &mut report) {
+            Some(settings) => (settings, report),
+            // 一个候选都没读到：落默认值（原因已记进 report）。
+            None => (Self::default_normalized(&mut report), report),
+        }
+    }
+
+    /// 落默认值的三个回退分支共用的收尾。
+    ///
+    /// [`Self::default`] 自身是自洽的（引擎 id 与目录指向同一个模型），但
+    /// 「磁盘上只装了另一个引擎的权重」这种首启情况要靠 `normalize` 的在盘
+    /// 决策来配平。不在这里过一遍 normalize 的话，GUI 会拿着默认引擎的 id
+    /// 去默认目录里找权重，1.3 GB 权重也会下错目录。
+    fn default_normalized(report: &mut SettingsLoadReport) -> Self {
+        let mut s = Self::default();
+        s.normalize_with_notes(&mut report.repairs);
+        s
+    }
+
+    /// 按候选顺序读第一份存在的 `settings.json`；一个都没有就返回 `None`，
+    /// 由调用方落默认值。
+    ///
+    /// 候选列表由调用方注入（[`Self::read_candidates`]），所以"老数据不丢"
+    /// 这条兜底能在单测里跑真文件断言，不必去碰进程全局的数据目录。
+    fn load_first_of(candidates: &[PathBuf], report: &mut SettingsLoadReport) -> Option<Self> {
+        for path in candidates {
+            match std::fs::read_to_string(path) {
+                Ok(text) => {
+                    report.config_path = Some(path.clone());
+                    report.found = true;
+                    return Some(match serde_json::from_str::<Settings>(&text) {
+                        Ok(mut s) => {
+                            s.normalize_with_notes(&mut report.repairs);
+                            s
+                        }
+                        Err(e) => {
+                            report.parse_error = Some(e.to_string());
+                            Self::default_normalized(report)
+                        }
+                    });
+                }
+                // 缺失不是错误：继续看下一个候选（老用户升级后第一次读）。
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    report.read_error = Some(e.to_string());
+                    report.config_path = Some(path.clone());
+                    return Some(Self::default_normalized(report));
+                }
+            }
+        }
+        None
+    }
+
+    /// 读取顺序：数据目录优先、安装目录兜底；两处同路径时只读一次。
+    ///
+    /// 纯函数：数据目录那份（`primary`）与老布局那份（`legacy`）都由调用方注入
+    /// —— `primary` 在数据目录解析不出来时是 `None` —— 顺序因此可直接单测。
+    fn read_candidates(primary: &Option<PathBuf>, legacy: &Path) -> Vec<PathBuf> {
+        match primary {
+            Some(primary) if primary != legacy => vec![primary.clone(), legacy.to_path_buf()],
+            Some(primary) => vec![primary.clone()],
+            None => vec![legacy.to_path_buf()],
+        }
+    }
+
+    /// Reconcile language, ASR catalog id, and model path after load / edit.
+    ///
+    /// Authority — the active size plus its per-size picks:
+    /// 1. `asr_model` picks the size; `asr_dirs[id]` is that size's folder,
+    ///    stored exactly as picked.
+    /// 2. A size with no pick uses the install layout `{app}/models/{name}`.
+    /// 3. `asr_model_dir` is then derived from the two above (never stored
+    ///    twice), and a folder that vanished on disk falls back to the install
+    ///    layout. A config from before `asr_dirs` existed is seeded from its
+    ///    single folder, so a hand-picked path survives the upgrade.
+    pub fn normalize(&mut self) {
+        let mut notes = Vec::new();
+        self.normalize_with_notes(&mut notes);
+    }
+
+    /// [`Self::normalize`] while recording every self-heal into `notes`.
+    ///
+    /// `notes` 是诊断文本：和 `repair_stale_model_dir` 一样写英文，GUI 会用
+    /// 英文前缀 `settings repaired: {note}` 落进同一份日志，中英混排不可读。
+    pub fn normalize_with_notes(&mut self, notes: &mut Vec<String>) {
+        self.language = normalize_source_language(&self.language);
+        let ui_lang = i18n::normalize_ui_language(&self.ui_language);
+        if ui_lang != self.ui_language {
+            self.ui_language = ui_lang;
+            notes.push(format!("invalid ui_language -> {}", self.ui_language));
+        }
+        self.chunk_target_seconds = clamp_chunk_target_seconds(self.chunk_target_seconds);
+        self.normalize_output_dir();
+        // 热词库不在这里自愈——它自己一份 `hotword.json`，见
+        // [`crate::hotword::HotwordStore::normalize`]。
+        // A muted install stays muted. The two switches of 0.1.9 were merged
+        // into one, so the merged switch inherits "on" only when neither family
+        // was turned off; this can only ever turn sound *off*, and once the
+        // config is saved the legacy keys are gone and `sound` is authoritative.
+        if self.sound
+            && (self.legacy_ui_sound == Some(false) || self.legacy_task_notify == Some(false))
+        {
+            self.sound = false;
+            notes.push("legacy ui_sound / task_notify was off -> sound stays off".into());
+        }
+        if self.legacy_ui_sound.is_some() || self.legacy_task_notify.is_some() {
+            self.legacy_ui_sound = None;
+            self.legacy_task_notify = None;
+        }
+        // At least one output format must stay enabled.
+        if !self.output_srt && !self.output_txt && !self.output_ass {
+            self.output_srt = true;
+            notes.push("all output formats were off -> SRT restored".into());
+        }
+        let script = TextScript::from_id(&self.text_script).id();
+        if script != self.text_script {
+            self.text_script = script.into();
+        }
+        repair_stale_model_dir(
+            &mut self.demucs_model_dir,
+            default_demucs_model_dir(),
+            notes,
+        );
+
+        // One-time migration from the root-pick shape: `asr_dirs` used to
+        // store the picked *root* while `asr_model_dir` held the sibling
+        // folder resolved from it. Rewrite the entry to the folder itself so
+        // the pick keeps meaning what the user actually selected.
+        let active = ModelId::parse_asr(&self.asr_model);
+        if let Some(pick) = self.asr_dirs.get(active.as_str()).cloned()
+            && self.asr_model_dir.parent() == Some(pick.as_path())
+            && ModelId::try_from_asr_dir(&self.asr_model_dir) == Some(active)
+        {
+            self.asr_dirs
+                .insert(active.as_str().to_string(), self.asr_model_dir.clone());
+        }
+        // A config written before `asr_dirs` existed carries a single folder:
+        // seed it as the active size's pick so a hand-picked path survives the
+        // upgrade, and let a catalog-named folder say which size it holds.
+        if self.asr_dirs.is_empty() {
+            let mut id = ModelId::parse_asr(&self.asr_model);
+            if let Some(named) = ModelId::try_from_asr_dir(&self.asr_model_dir)
+                && self.asr_model_dir != resolve_model_dir(named.as_str())
+            {
+                // A catalog-named folder outside the install layout is a
+                // deliberate pick — it wins over the stored id. A folder that
+                // IS the install layout (e.g. the serde default backing an
+                // absent field) must not override the parsed id: the int8
+                // variant would otherwise be reset to its fp16 sibling.
+                self.asr_model = named.as_str().into();
+                id = named;
+            }
+            let dir = self.asr_model_dir.clone();
+            // Install-layout defaults are recomputed per id on every read —
+            // the only thing worth seeding is a genuine hand-picked folder.
+            if dir != resolve_model_dir(id.as_str())
+                && ModelId::try_from_asr_dir(&dir)
+                    .is_none_or(|named| dir != resolve_model_dir(named.as_str()))
+            {
+                self.remember_asr_dir(id, &dir);
+            }
+        }
+        let id = ModelId::parse_asr(&self.asr_model);
+        self.asr_model = id.as_str().into();
+        // Derived, never stored twice: the active size's own pick, else the
+        // install layout.
+        self.asr_model_dir = self.asr_dir_for(id);
+        repair_stale_model_dir(
+            &mut self.asr_model_dir,
+            resolve_model_dir(id.as_str()),
+            notes,
+        );
+
+        // Aligner reconcile — mirrors the ASR block: the catalog id decides
+        // the layout default, per-model picks survive, and a legacy
+        // single-folder config (before aligner_model/aligner_dirs existed)
+        // seeds that model's pick so a hand-picked path survives the upgrade.
+        // 旧版 Qwen 的 per-model 键跟着目录名一起改名。布局默认路径不是「手挑」，
+        // 直接丢掉让新默认目录生效；真正手挑的路径归到 Ultra 名下。
+        if let Some(dir) = self.aligner_dirs.remove(QWEN_ALIGN_LEGACY)
+            && dir != resolve_model_dir(QWEN_ALIGN_LEGACY)
+        {
+            self.aligner_dirs
+                .entry(ModelId::QwenAlignUltra.as_str().to_string())
+                .or_insert(dir);
+        }
+        let legacy_name = ModelId::is_legacy_aligner_name(&self.aligner_model);
+        let parsed = ModelId::try_parse_aligner(&self.aligner_model);
+        let align_id = match parsed {
+            Some(id) => id,
+            None => {
+                // Unset (first run / upgrade from a config without the
+                // field): keep Qwen unless only CTC is on disk — the default
+                // selection matches the default button; fall back to CTC only
+                // when it is the one that exists.
+                let ctc = resolve_model_dir(OMNI_ASR_CTC_300M).is_dir();
+                let qwen = resolve_model_dir(QWEN_ALIGN_ULTRA).is_dir();
+                let id = decide_default_aligner(ctc, qwen);
+                notes.push(format!("aligner model unset -> {}", id.as_str()));
+                id
+            }
+        };
+        // 老配置里那**一个**目录属于谁：目录名认得出 catalog 名就对号入座，
+        // 认不出（用户自己改过名，GUI 的目录选择器允许）就归给这次决策选中的
+        // 模型。两种都得先保住路径 —— 丢掉它等于让升级用户重新找一遍权重，
+        // 而下面那行派生赋值会无条件覆盖它。
+        //
+        // 判据是「不是**任何一个**对齐器的布局默认」而不是「不是选中那个的」：
+        // 旧版本写进配置的就是 Qwen 布局目录，那不是用户挑的路径，不该在决策
+        // 翻到别的引擎时被记成它的「专属选择」。
+        let is_layout_default = ModelId::ALIGNER_CHOICES
+            .iter()
+            .any(|m| self.aligner_model_dir == resolve_model_dir(m.as_str()))
+            || self.aligner_model_dir == resolve_model_dir(QWEN_ALIGN_LEGACY);
+        if (parsed.is_none() || legacy_name)
+            && self.aligner_dirs.is_empty()
+            && !self.aligner_model_dir.as_os_str().is_empty()
+            && !is_layout_default
+        {
+            let picked = self.aligner_model_dir.clone();
+            self.remember_aligner_dir(
+                ModelId::try_from_aligner_dir(&picked).unwrap_or(align_id),
+                &picked,
+            );
+        }
+        self.aligner_model = align_id.as_str().into();
+        // Derived, never stored twice: the active model's own pick, else the
+        // install layout.
+        self.aligner_model_dir = self.aligner_dir_for(align_id);
+        repair_stale_model_dir(
+            &mut self.aligner_model_dir,
+            resolve_model_dir(align_id.as_str()),
+            notes,
+        );
+    }
+
+    /// Default empty → `{data}/output`; relative → join the data directory
+    /// (stable vs CWD, and the same place the models live).
+    fn normalize_output_dir(&mut self) {
+        if self.output_dir.as_os_str().is_empty() {
+            self.output_dir = default_output_dir();
+            return;
+        }
+        if self.output_dir.is_relative() {
+            self.output_dir = paths::data_dir().join(&self.output_dir);
+        }
+    }
+
+    /// Folder used for finished `.srt` (always non-empty after [`Self::normalize`]).
+    pub fn resolved_output_dir(&self) -> PathBuf {
+        if self.output_dir.as_os_str().is_empty() {
+            return default_output_dir();
+        }
+        if self.output_dir.is_relative() {
+            return paths::data_dir().join(&self.output_dir);
+        }
+        self.output_dir.clone()
+    }
+
+    /// Primary SRT folder for a media file: its own directory when
+    /// [`Self::save_next_to_source`] and the file has a parent dir, else
+    /// [`Self::resolved_output_dir`]. Callers fall back to
+    /// [`Self::resolved_output_dir`] when a write there fails.
+    pub fn srt_target_dir(&self, media: &Path) -> PathBuf {
+        if self.save_next_to_source
+            && let Some(parent) = media.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            return parent.to_path_buf();
+        }
+        self.resolved_output_dir()
+    }
+
+    /// 把 `ui_language` 设置解析成具体语言：`system` 时探测操作系统，
+    /// 探测失败保守回退中文（见 [`i18n::detect_system_lang`]）。
+    pub fn resolved_ui_language(&self) -> i18n::UiLang {
+        match self.ui_language.as_str() {
+            i18n::UI_LANGUAGE_ZH => i18n::UiLang::Zh,
+            i18n::UI_LANGUAGE_EN => i18n::UiLang::En,
+            _ => i18n::detect_system_lang(),
+        }
+    }
+
+    /// Chunk target used by the pipeline (always within product range).
+    #[inline]
+    pub fn chunk_target_seconds_clamped(&self) -> u32 {
+        clamp_chunk_target_seconds(self.chunk_target_seconds)
+    }
+
+    /// Parsed Chinese output script (`simplified` when unset / unknown).
+    #[inline]
+    pub fn text_script_choice(&self) -> TextScript {
+        TextScript::from_id(&self.text_script)
+    }
+
+    /// Conversion to apply for a source language, or `None` when the setting
+    /// does not apply (non-Chinese sources keep the raw ASR script).
+    pub fn text_script_for(&self, lang_key: &str) -> Option<TextScript> {
+        text_script::applies_to_language(lang_key).then(|| self.text_script_choice())
+    }
+
+    /// Directory that owns the Demucs weights (never empty).
+    pub fn resolved_demucs_model_dir(&self) -> PathBuf {
+        if self.demucs_model_dir.as_os_str().is_empty() {
+            return default_demucs_model_dir();
+        }
+        self.demucs_model_dir.clone()
+    }
+
+    /// 热词粗转模型目录（空 = 安装布局默认）。
+    pub fn resolved_sensevoice_model_dir(&self) -> PathBuf {
+        if self.sensevoice_model_dir.as_os_str().is_empty() {
+            return crate::model::default_sensevoice_model_dir();
+        }
+        self.sensevoice_model_dir.clone()
+    }
+
+    pub fn selected_asr_id(&self) -> ModelId {
+        ModelId::parse_asr(&self.asr_model)
+    }
+
+    /// True when the active ASR selection is the int8-quantized variant of
+    /// its size (`Qwen3-ASR-*-int8`).
+    pub fn asr_quantized(&self) -> bool {
+        self.selected_asr_id().is_quantized()
+    }
+
+    /// Switch the active ASR to the fp16 / int8 variant of the current size.
+    ///
+    /// Quantized checkpoints are catalog ids of their own, so each of the
+    /// four ASR variants (two sizes × fp16/int8) keeps its own directory in
+    /// [`Self::asr_dirs`] — same per-size memory as the size switch.
+    pub fn set_asr_quantized(&mut self, quantized: bool) {
+        let id = self.selected_asr_id().with_quant(quantized);
+        if id != self.selected_asr_id() {
+            self.select_asr_model(id);
+        }
+    }
+
+    /// Directory bound to one ASR size: the folder hand-picked for it, else
+    /// the layout default ([`resolve_model_dir`] — 数据目录优先)。
+    ///
+    /// WYSIWYG — no folder-name guessing, no sibling lookups: what the user
+    /// picked is what that size loads, and a size nobody picked simply uses
+    /// the layout default. Lookups never persist — nothing here writes
+    /// `asr_dirs`.
+    pub fn asr_dir_for(&self, id: ModelId) -> PathBuf {
+        self.asr_dirs
+            .get(id.as_str())
+            .cloned()
+            .unwrap_or_else(|| resolve_model_dir(id.as_str()))
+    }
+
+    /// Bind a hand-picked directory to the **active** size, verbatim.
+    ///
+    /// The pick is stored and loaded exactly as given. Picking never switches
+    /// the active size and never re-resolves the folder name — moving between
+    /// sizes is [`Self::select_asr_model`]'s job, and a size only ever has two
+    /// answers: its own pick or the install layout.
+    pub fn set_asr_dir(&mut self, dir: PathBuf) -> ModelId {
+        let id = self.selected_asr_id();
+        self.remember_asr_dir(id, &dir);
+        self.asr_model_dir = dir;
+        id
+    }
+
+    /// Remember `dir` for `id` — the layout default ([`resolve_model_dir`]) is
+    /// *removed* rather than stored: it is recomputed from the resolved data
+    /// directory on every read, and keeping it would pin this machine's absolute
+    /// path into the config (and break a moved app).
+    fn remember_asr_dir(&mut self, id: ModelId, dir: &Path) {
+        if dir == resolve_model_dir(id.as_str()).as_path() {
+            self.asr_dirs.remove(id.as_str());
+        } else {
+            self.asr_dirs
+                .insert(id.as_str().to_string(), dir.to_path_buf());
+        }
+    }
+
+    /// Switch active ASR size; every size keeps its own directory — the
+    /// folder picked for it, or the layout default when it has none.
+    pub fn select_asr_model(&mut self, id: ModelId) {
+        if id.kind() != ModelKind::Asr {
+            return;
+        }
+        self.asr_model = id.as_str().into();
+        // Per-size memory: switching *back* to a size restores the folder that
+        // size was given, instead of resetting it to the layout default.
+        self.asr_model_dir = self.asr_dir_for(id);
+    }
+
+    // ── Aligner selection（镜像 ASR 尺寸选择的模式）────────────────────
+
+    /// Active aligner catalog id.
+    pub fn selected_aligner_id(&self) -> ModelId {
+        ModelId::parse_aligner(&self.aligner_model)
+    }
+
+    /// Directory bound to one aligner model: the folder hand-picked for it,
+    /// else the install layout. Lookups never persist.
+    pub fn aligner_dir_for(&self, id: ModelId) -> PathBuf {
+        self.aligner_dirs
+            .get(id.as_str())
+            .cloned()
+            .unwrap_or_else(|| resolve_model_dir(id.as_str()))
+    }
+
+    /// Switch active aligner model; each model keeps its own directory —
+    /// same per-model memory as the ASR size switch.
+    pub fn select_aligner_model(&mut self, id: ModelId) {
+        if id.kind() != ModelKind::Align {
+            return;
+        }
+        self.aligner_model = id.as_str().into();
+        self.aligner_model_dir = self.aligner_dir_for(id);
+    }
+
+    /// Bind a hand-picked directory to the **active** aligner model, verbatim.
+    pub fn set_aligner_dir(&mut self, dir: PathBuf) -> ModelId {
+        let id = self.selected_aligner_id();
+        self.aligner_model_dir = dir.clone();
+        self.remember_aligner_dir(id, &dir);
+        id
+    }
+
+    fn remember_aligner_dir(&mut self, id: ModelId, dir: &Path) {
+        if dir == resolve_model_dir(id.as_str()).as_path() {
+            self.aligner_dirs.remove(id.as_str());
+        } else {
+            self.aligner_dirs
+                .insert(id.as_str().to_string(), dir.to_path_buf());
+        }
+    }
+
+    /// Qwen 的对齐器输出不带标点，管线从转写文本把标点贴回词上；CTC 对齐器的
+    /// token 原生保留标点（零时长搭在前一字符上）。决定对齐阶段是否要做
+    /// 标点恢复。
+    pub fn aligner_strips_punctuation(&self) -> bool {
+        self.selected_aligner_id() == ModelId::QwenAlignUltra
+    }
+
+    /// Normalize in place, then persist to `settings.json`.
+    pub fn save(&mut self) -> Result<PathBuf, String> {
+        self.normalize();
+        let path = match Self::config_path() {
+            Some(path) => path,
+            None => {
+                // 清晰错误：说清"没有可写的数据目录"，而不是笼统的"找不到应用目录"，
+                // 也不要在这里退回临时目录。
+                let reason = crate::paths::data_root()
+                    .as_ref()
+                    .err()
+                    .map(|e| e.message())
+                    .unwrap_or("data directory unavailable");
+                return Err(crate::i18n::settings_no_writable_dir(reason));
+            }
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        crate::media::write_atomic(&path, text).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
+    /// True when ASR + Aligner model dirs look complete enough to load.
+    ///
+    /// The aligner is only required when a **timed** format is on. TXT is built
+    /// from the text alone (`crate::txt`), so a TXT-only task must not be forced
+    /// to download a checkpoint whose output nothing consumes.
+    pub fn can_start(&self) -> Result<(), String> {
+        crate::asr::check_asr_model_dir(&self.asr_model_dir).map_err(|e| e.to_string())?;
+        if timed_output_selected(self.output_srt, self.output_ass) {
+            crate::asr::check_aligner_model_dir(&self.aligner_model_dir)
+                .map_err(|e| e.to_string())?;
+        }
+        if self.vocal_separation {
+            crate::asr::check_demucs_model_dir(&self.resolved_demucs_model_dir())
+                .map_err(|e| e.to_string())?;
+        }
+        self.check_hotword_ready()
+    }
+
+    /// 文稿匹配的门禁：文字来自用户，**不需要 ASR**；只要对齐器（以及人选的人声
+    /// 分离）在位，且至少有一个带时间轴的输出。热词在文稿路径上没有消费者，不查。
+    pub fn can_start_transcript(&self) -> Result<(), String> {
+        if !timed_output_selected(self.output_srt, self.output_ass) {
+            return Err(
+                crate::i18n::t(crate::i18n::ERR_TRANSCRIPT_REQUIRES_TIMED_OUTPUT).to_string(),
+            );
+        }
+        crate::asr::check_aligner_model_dir(&self.aligner_model_dir).map_err(|e| e.to_string())?;
+        if self.vocal_separation {
+            crate::asr::check_demucs_model_dir(&self.resolved_demucs_model_dir())
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// 热词这一路的开跑前检查：选了组就必须有词、且粗转模型在位。
+    ///
+    /// 空组报错而不是静默跳过——「选了却什么都没发生」比直接说清楚更糟。组**不存在**
+    /// 时 [`crate::hotword::HotwordStore::resolve_run`] 返回 `None`，进不到这里：那是
+    /// 「这一行显示无热词、那就真不用热词」，不该反过来要求粗转模型。
+    ///
+    /// **语言门禁先行**：热词只接中文与英文（[`crate::lang::supports_hotwords`]）。
+    /// 其他语言的任务即使带着 `hotword_run`，也不该为词表或粗转模型报错——流程
+    /// 压根不会跑（管线侧同一个判据见 `asr.rs::stage_rough_transcribe`）。
+    ///
+    /// [`Self::can_start`] 与 [`Self::hotword_blocks_start`] **共用**这一个判据，
+    /// 免得「能不能跑」与「该去哪儿修」两处各写一份、日后再漂开。
+    fn check_hotword_ready(&self) -> Result<(), String> {
+        if !crate::lang::supports_hotwords(&self.language) {
+            return Ok(());
+        }
+        let Some(run) = &self.hotword_run else {
+            return Ok(());
+        };
+        if !run.is_usable() {
+            return Err(crate::i18n::hotword_group_empty(&run.group_name));
+        }
+        crate::asr::check_sensevoice_model_dir(&self.resolved_sensevoice_model_dir())
+            .map_err(|e| e.to_string())
+    }
+
+    /// 开不了跑时，挡路的是不是**热词**（组没词 / 粗转模型缺失）。
+    ///
+    /// 界面据此把抽屉翻到热词页而不是设置页：这两条错误只有热词页能修（往词表里
+    /// 加词、换一组、下粗转模型），翻到设置页只会让人对着一排绿点找不到问题。
+    pub fn hotword_blocks_start(&self) -> bool {
+        self.hotword_run.is_some() && self.check_hotword_ready().is_err()
+    }
+
+    /// After a successful download: bind paths **only if** this id is the active
+    /// selection. A non-selected install leaves the selection alone — its files
+    /// already live under install-layout dirs.
+    ///
+    /// Returns `true` when active settings changed (caller should re-probe).
+    /// Nothing new to save: downloads land in the directory the settings already
+    /// point at, and that pick is already recorded per model.
+    pub fn bind_download_if_active(&mut self, id: ModelId, model_dir: PathBuf) -> bool {
+        match id.kind() {
+            ModelKind::Asr => {
+                if self.selected_asr_id() != id {
+                    return false;
+                }
+                self.asr_model = id.as_str().into();
+                self.remember_asr_dir(id, &model_dir);
+                self.asr_model_dir = model_dir;
+                true
+            }
+            ModelKind::Align => {
+                // 两个对齐引擎并存后，「下载的一定是当前选中那个」不再由类型
+                // 保证：非选中引擎的下载不该动当前选择的目录，也不该把它的路径
+                // 写进 `aligner_dirs`（那是「用户挑过」的记录，不是下载产物）。
+                if self.selected_aligner_id() != id {
+                    return false;
+                }
+                self.remember_aligner_dir(id, &model_dir);
+                self.aligner_model_dir = model_dir;
+                true
+            }
+            // Weights always land in the install-layout dir the settings
+            // already point at; nothing to re-bind.
+            ModelKind::Demucs => false,
+            // 热词粗转同理：它没有「选中 id」这回事，下载落点就是设置里那个目录。
+            ModelKind::Hotword => false,
+        }
+    }
+}
+
+/// If `current` doesn't exist on disk but `default` does, switch to `default`.
+///
+/// This handles the portable-app case: when the user moves the app folder,
+/// stored absolute model paths become stale, but if the models were moved
+/// together with the app (same `models/` layout), we auto-repair to the
+/// current install-layout location.  Custom user-chosen paths outside the
+/// install layout are left alone.
+/// Replace `current` with `default` when `current` no longer exists but the
+/// install-layout default does. Every actual switch is pushed into `notes` so
+/// the GUI can log the repair instead of silently rewriting settings; no-op
+/// calls record nothing.
+/// Aligner 模型的首次运行决策：默认 Qwen；只有磁盘上仅装了 CTC 时才退 CTC
+/// （默认按钮 = 默认选择；两者都没装时选 Qwen 让下载提示指向默认引擎）。
+fn decide_default_aligner(ctc_present: bool, qwen_present: bool) -> ModelId {
+    if !qwen_present && ctc_present {
+        ModelId::OmniAsrCtc300M
+    } else {
+        ModelId::default_aligner()
+    }
+}
+
+fn repair_stale_model_dir(current: &mut PathBuf, default: PathBuf, notes: &mut Vec<String>) {
+    if !current.is_dir() && default.is_dir() {
+        notes.push(format!(
+            "model dir reset (missing): {} → {}",
+            current.display(),
+            default.display()
+        ));
+        *current = default;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::QWEN3_ASR_17B;
+
+    #[test]
+    fn ui_language_defaults_to_system() {
+        let mut s = Settings::default();
+        assert_eq!(s.ui_language, i18n::UI_LANGUAGE_SYSTEM);
+        s.ui_language = "zh".into();
+        assert_eq!(s.resolved_ui_language(), i18n::UiLang::Zh);
+        s.ui_language = "en".into();
+        assert_eq!(s.resolved_ui_language(), i18n::UiLang::En);
+        s.ui_language = "system".into();
+        assert!(matches!(
+            s.resolved_ui_language(),
+            i18n::UiLang::Zh | i18n::UiLang::En
+        ));
+    }
+
+    #[test]
+    fn subtitle_beautify_missing_key_defaults_off() {
+        let s: Settings = serde_json::from_str("{}").expect("empty settings object");
+        assert!(!s.subtitle_beautify);
+    }
+
+    #[test]
+    fn ui_language_missing_key_defaults_to_system() {
+        // 旧版 settings.json 没有这个字段，反序列化必须落到默认值。
+        let s: Settings = serde_json::from_str("{}").expect("empty settings object");
+        assert_eq!(s.ui_language, i18n::UI_LANGUAGE_SYSTEM);
+    }
+
+    #[test]
+    fn normalize_repairs_bad_ui_language() {
+        let mut s = Settings {
+            ui_language: "klingon".into(),
+            ..Settings::default()
+        };
+        let mut notes = Vec::new();
+        s.normalize_with_notes(&mut notes);
+        assert_eq!(s.ui_language, i18n::UI_LANGUAGE_SYSTEM);
+        assert!(notes.iter().any(|n| n.contains("ui_language")));
+    }
+
+    #[test]
+    fn normalize_keeps_valid_ui_language() {
+        let mut s = Settings {
+            ui_language: "en".into(),
+            ..Settings::default()
+        };
+        let mut notes = Vec::new();
+        s.normalize_with_notes(&mut notes);
+        assert_eq!(s.ui_language, "en");
+        assert!(!notes.iter().any(|n| n.contains("ui_language")));
+    }
+
+    #[test]
+    fn close_to_tray_defaults_off() {
+        // 关窗语义向后兼容：缺字段（老配置）= 关窗直接退出，要托盘显式打开。
+        let s: Settings = serde_json::from_str("{}").expect("empty settings object");
+        assert!(!s.close_to_tray);
+        assert!(!Settings::default().close_to_tray);
+    }
+
+    #[test]
+    fn default_language_and_asr_id() {
+        assert_eq!(Settings::default().language, "zh");
+        assert_eq!(Settings::default().selected_asr_id(), ModelId::Qwen3Asr06B);
+    }
+
+    #[test]
+    fn can_start_rejects_missing_model_dirs() {
+        let s = Settings {
+            asr_model_dir: PathBuf::from(r"D:\__oneasr_no_such_asr__"),
+            aligner_model_dir: PathBuf::from(r"D:\__oneasr_no_such_align__"),
+            ..Settings::default()
+        };
+        assert!(s.can_start().is_err());
+    }
+
+    #[test]
+    fn can_start_requires_demucs_only_when_separation_on() {
+        let root =
+            std::env::temp_dir().join(format!("oneasr_can_start_demucs_{}", std::process::id()));
+        let asr = root.join("asr-test");
+        let align = root.join("align-test");
+        let demucs = root.join("demucs-test");
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in [&asr, &align, &demucs] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let blob = vec![0u8; 4096];
+        std::fs::write(asr.join("config.json"), &blob).unwrap();
+        std::fs::write(asr.join("tokenizer.json"), &blob).unwrap();
+        std::fs::write(asr.join("model.safetensors"), &blob).unwrap();
+        std::fs::write(align.join("config.json"), &blob).unwrap();
+        std::fs::write(align.join("tokenizer.json"), &blob).unwrap();
+        std::fs::write(align.join("tokenizer_config.json"), &blob).unwrap();
+        std::fs::write(align.join("model.safetensors"), &blob).unwrap();
+
+        let mut s = Settings {
+            asr_model_dir: asr,
+            aligner_model_dir: align,
+            demucs_model_dir: demucs.clone(),
+            vocal_separation: false,
+            ..Settings::default()
+        };
+        assert!(s.can_start().is_ok(), "{:?}", s.can_start());
+
+        s.vocal_separation = true;
+        let err = crate::i18n::with_ui_lang(crate::i18n::UiLang::Zh, || s.can_start().unwrap_err());
+        assert!(err.contains("人声分离"), "{err}");
+        assert!(err.contains("htdemucs_ft_vocals.safetensors"), "{err}");
+
+        std::fs::write(
+            demucs.join(crate::engine::local::DEMUCS_WEIGHTS_FILE),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+        assert!(s.can_start().is_ok(), "{:?}", s.can_start());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 文稿路径的文字来自用户，ASR 没装也不该挡；但它仍然要求 CTC 对齐器与
+    /// 至少一个带时间轴的输出。断骨锚点：把 `can_start_transcript` 改回
+    /// `can_start()`，第一条断言变红。
+    #[test]
+    fn transcript_start_ignores_missing_asr_but_needs_a_timed_output() {
+        let root =
+            std::env::temp_dir().join(format!("oneasr_transcript_gate_{}", std::process::id()));
+        let align = root.join("align-test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&align).unwrap();
+        let blob = vec![0u8; 4096];
+        for name in [
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "model.safetensors",
+        ] {
+            std::fs::write(align.join(name), &blob).unwrap();
+        }
+
+        let s = Settings {
+            asr_model_dir: root.join("missing-asr"),
+            aligner_model_dir: align,
+            output_srt: true,
+            output_ass: false,
+            ..Settings::default()
+        };
+        assert!(s.can_start().is_err(), "普通路径仍然要求 ASR");
+        assert!(
+            s.can_start_transcript().is_ok(),
+            "文稿路径不加载 ASR: {:?}",
+            s.can_start_transcript()
+        );
+
+        let mut txt_only = s.clone();
+        txt_only.output_srt = false;
+        txt_only.output_ass = false;
+        txt_only.output_txt = true;
+        let err = crate::i18n::with_ui_lang(crate::i18n::UiLang::Zh, || {
+            txt_only.can_start_transcript().unwrap_err()
+        });
+        assert!(err.contains("SRT") && err.contains("ASS"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 「有没有带时间轴的产物」这条判据全仓库只有一处：门禁
+    /// （`can_start` 要不要对齐器、`can_start_transcript` 放不放行）与 CLI 的
+    /// 用法校验（`align --no-srt --txt`）问的是同一个函数。
+    ///
+    /// 断骨锚点：把 `timed_output_selected` 改成 `output_srt`（丢掉 ASS），
+    /// 下面 ASS-only 那条断言立刻变红。
+    #[test]
+    fn the_timed_output_rule_has_one_home() {
+        assert!(timed_output_selected(true, false), "SRT 是带时间轴的");
+        assert!(timed_output_selected(false, true), "ASS 也是带时间轴的");
+        assert!(timed_output_selected(true, true), "两个都要时当然算");
+        assert!(!timed_output_selected(false, false), "纯 TXT 没有时间轴");
+
+        // 门禁跟这条判据一致：纯 TXT 的普通转写不需要对齐器（可以跑），
+        // 但文稿匹配必须拒（没有时间轴产物）。
+        let mut s = Settings {
+            output_srt: false,
+            output_ass: false,
+            output_txt: true,
+            ..Settings::default()
+        };
+        s.normalize();
+        assert!(
+            !timed_output_selected(s.output_srt, s.output_ass),
+            "normalize 不得把 TXT-only 变成有时间轴"
+        );
+        assert!(
+            s.can_start_transcript().is_err(),
+            "纯 TXT 的文稿匹配必须拒：{:?}",
+            s.can_start_transcript()
+        );
+    }
+
+    /// 热词挡路的判据与 `can_start` **同源**（都走 `check_hotword_ready`）：选了组
+    /// 就必须有词、且粗转模型在位；没选热词时永远是「不是热词的锅」。
+    ///
+    /// 断骨验证：让 `hotword_blocks_start` 直接返回 `false`（界面就会一律翻到设置页，
+    /// 而那里没有任何热词可修），本测试立刻变红。
+    #[test]
+    fn hotword_blocker_is_reported_as_such() {
+        fn run_of(words: &str) -> crate::hotword::HotwordRun {
+            crate::hotword::HotwordRun {
+                group_id: "default".into(),
+                group_name: "默认".into(),
+                text: words.into(),
+                top_k: 20,
+                threshold: 0.85,
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!("oneasr_hotword_gate_{}", std::process::id()));
+        let asr = root.join("asr-test");
+        let align = root.join("align-test");
+        let sense = root.join("sensevoice-test");
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in [&asr, &align, &sense] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let blob = vec![0u8; 4096];
+        std::fs::write(asr.join("config.json"), &blob).unwrap();
+        std::fs::write(asr.join("tokenizer.json"), &blob).unwrap();
+        std::fs::write(asr.join("model.safetensors"), &blob).unwrap();
+        std::fs::write(align.join("config.json"), &blob).unwrap();
+        std::fs::write(align.join("tokenizer.json"), &blob).unwrap();
+        std::fs::write(align.join("tokenizer_config.json"), &blob).unwrap();
+        std::fs::write(align.join("model.safetensors"), &blob).unwrap();
+
+        // 目录名刻意不叫 `SenseVoiceSmall`：那个名字走清单精确校验（尺寸 + sha256），
+        // 4 KB 占位文件过不了。
+        let mut s = Settings {
+            asr_model_dir: asr,
+            aligner_model_dir: align,
+            sensevoice_model_dir: sense.clone(),
+            ..Settings::default()
+        };
+
+        // ① 没选热词：能跑，也不是热词挡路
+        s.hotword_run = None;
+        assert!(s.can_start().is_ok(), "{:?}", s.can_start());
+        assert!(!s.hotword_blocks_start());
+
+        // ② 选了组但没词：热词挡路，报错点名是哪个组
+        s.hotword_run = Some(run_of("   "));
+        assert!(s.hotword_blocks_start());
+        let err = crate::i18n::with_ui_lang(crate::i18n::UiLang::Zh, || s.can_start().unwrap_err());
+        assert!(err.contains("默认"), "报错要说是哪个组：{err}");
+
+        // ③ 有词、但粗转模型不在：同样是热词挡路（那个模型在热词页下载）
+        s.hotword_run = Some(run_of("甲词"));
+        assert!(s.hotword_blocks_start());
+        assert!(s.can_start().is_err());
+
+        // ④ 非中英的语言：热词流程根本不接入——空组不报错、缺粗转模型也不拦。
+        //    本测试走到这里的夹具正好是「粗转模型缺失」，用它最能说明问题。
+        //    断骨锚点：把 `check_hotword_ready` 开头那道语言闸去掉，本段立刻变红。
+        s.language = "ja".into();
+        assert!(s.can_start().is_ok(), "{:?}", s.can_start());
+        assert!(!s.hotword_blocks_start());
+        s.hotword_run = Some(run_of("   "));
+        assert!(
+            s.can_start().is_ok(),
+            "非中英语言连空组都不该拦：{:?}",
+            s.can_start()
+        );
+        assert!(!s.hotword_blocks_start());
+        s.language = "zh".into();
+        s.hotword_run = Some(run_of("甲词"));
+
+        // ⑤ 粗转模型就位：能跑，且不再算热词挡路
+        for name in crate::engine::local::SENSEVOICE_REQUIRED_FILES {
+            std::fs::write(sense.join(name), &blob).unwrap();
+        }
+        assert!(s.can_start().is_ok(), "{:?}", s.can_start());
+        assert!(!s.hotword_blocks_start());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn normalize_syncs_asr_model_from_catalog_path() {
+        let mut s = Settings {
+            asr_model: QWEN3_ASR_06B.into(),
+            // 目录名匹配靠 file_name()，而 Linux 上 r"C:\App\models\X" 没有
+            // 分隔符、整体被当成文件名，解析必然失败。用 join 构造。
+            asr_model_dir: Path::new("App").join("models").join("Qwen3-ASR-1.7B-hf"),
+            ..Settings::default()
+        };
+        s.normalize();
+        assert_eq!(s.asr_model, QWEN3_ASR_17B);
+        assert_eq!(s.selected_asr_id(), ModelId::Qwen3Asr17B);
+    }
+
+    #[test]
+    fn bind_download_only_when_selected() {
+        let mut s = Settings::default();
+        s.select_asr_model(ModelId::Qwen3Asr17B);
+        let dir_06 = PathBuf::from(r"C:\App\models\Qwen3-ASR-0.6B-hf");
+        assert!(!s.bind_download_if_active(ModelId::Qwen3Asr06B, dir_06));
+        assert_eq!(s.selected_asr_id(), ModelId::Qwen3Asr17B);
+        assert!(
+            s.asr_model_dir
+                .to_string_lossy()
+                .contains("Qwen3-ASR-1.7B-hf")
+        );
+
+        let dir_17 = PathBuf::from(r"C:\App\models\Qwen3-ASR-1.7B-hf");
+        assert!(s.bind_download_if_active(ModelId::Qwen3Asr17B, dir_17.clone()));
+        assert_eq!(s.asr_model_dir, dir_17);
+    }
+
+    /// 对齐侧与 ASR 侧同一口径：非选中引擎的下载完成不得改动当前选择的目录，
+    /// 也不得把它写进 `aligner_dirs`（那是「用户挑过」的记录，不是下载产物）。
+    #[test]
+    fn bind_aligner_download_only_when_selected() {
+        let mut s = Settings::default();
+        let ctc = ModelId::OmniAsrCtc300M;
+        // 默认现在是 Qwen；这条用例测的是「非选中引擎」这一支，先把 CTC 选上。
+        s.select_aligner_model(ctc);
+        assert_eq!(s.selected_aligner_id(), ctc);
+        let ctc_pick = std::env::temp_dir().join("oneasr_bind_ctc");
+        s.set_aligner_dir(ctc_pick.clone());
+
+        // 非选中引擎：目录不动，也不进 per-model 记忆。
+        let qwen_dir = std::env::temp_dir().join("oneasr_bind_qwen");
+        assert!(!s.bind_download_if_active(ModelId::QwenAlignUltra, qwen_dir.clone()));
+        assert_eq!(s.aligner_model_dir, ctc_pick);
+        assert!(
+            !s.aligner_dirs
+                .contains_key(ModelId::QwenAlignUltra.as_str())
+        );
+
+        // 选中的那个：绑定并记住（是用户挑过的目录，不是布局默认）。
+        assert!(s.bind_download_if_active(ctc, ctc_pick.clone()));
+        assert_eq!(s.aligner_model_dir, ctc_pick);
+        assert_eq!(s.aligner_dirs.get(ctc.as_str()), Some(&ctc_pick));
+    }
+
+    #[test]
+    fn select_17b_updates_path() {
+        let mut s = Settings::default();
+        s.select_asr_model(ModelId::Qwen3Asr17B);
+        assert_eq!(s.selected_asr_id(), ModelId::Qwen3Asr17B);
+        assert!(
+            s.asr_model_dir
+                .to_string_lossy()
+                .contains("Qwen3-ASR-1.7B-hf")
+        );
+    }
+
+    #[test]
+    fn quantized_selection_switches_variant_and_keeps_per_variant_dirs() {
+        let mut s = Settings::default();
+        assert!(!s.asr_quantized());
+
+        // 0.6B → 0.6B int8: the size stays, the catalog id and default dir change.
+        s.set_asr_quantized(true);
+        assert_eq!(s.selected_asr_id(), ModelId::Qwen3Asr06BInt8);
+        assert!(
+            s.asr_model_dir
+                .to_string_lossy()
+                .contains("Qwen3-ASR-0.6B-int8"),
+            "{}",
+            s.asr_model_dir.display()
+        );
+
+        // Each of the four variants remembers its own folder.
+        // 路径用 join 构造：写死 r"C:\custom\models\..." 在 Linux 上是一整个
+        // 文件名（不是绝对路径），测的就不是「用户挑的目录」这件事了。
+        let custom_int8 = std::env::temp_dir()
+            .join("custom")
+            .join("models")
+            .join("Qwen3-ASR-0.6B-int8");
+        s.set_asr_dir(custom_int8.clone());
+        s.set_asr_quantized(false);
+        assert_eq!(s.selected_asr_id(), ModelId::Qwen3Asr06B);
+        assert!(
+            s.asr_model_dir
+                .to_string_lossy()
+                .contains("Qwen3-ASR-0.6B-hf"),
+            "{}",
+            s.asr_model_dir.display()
+        );
+        s.set_asr_quantized(true);
+        assert_eq!(s.asr_model_dir, custom_int8);
+
+        // Core selection is a plain catalog id: picking a size always lands on
+        // its fp16 id, and the quantized state is a separate, explicit choice
+        // (the GUI combines the two when it renders the chips).
+        s.select_asr_model(ModelId::Qwen3Asr17B);
+        assert_eq!(s.selected_asr_id(), ModelId::Qwen3Asr17B);
+        s.set_asr_quantized(true);
+        assert_eq!(s.selected_asr_id(), ModelId::Qwen3Asr17BInt8);
+        assert!(
+            s.asr_model_dir
+                .to_string_lossy()
+                .contains("Qwen3-ASR-1.7B-int8"),
+            "{}",
+            s.asr_model_dir.display()
+        );
+
+        // Setting the same state twice is a no-op (no dir reset).
+        let before = s.asr_model_dir.clone();
+        s.set_asr_quantized(true);
+        assert_eq!(s.asr_model_dir, before);
+    }
+
+    #[test]
+    fn parse_round_trips_an_int8_active_model() {
+        // A settings.json saved with the int8 variant active must load back as
+        // exactly that variant, not fall back to fp16 0.6B.
+        let mut s: Settings =
+            serde_json::from_str(r#"{"asr_model":"Qwen3-ASR-0.6B-int8"}"#).unwrap();
+        s.normalize();
+        assert_eq!(s.selected_asr_id(), ModelId::Qwen3Asr06BInt8);
+        assert!(s.asr_quantized());
+    }
+
+    #[test]
+    fn each_asr_size_keeps_its_own_dir() {
+        let mut s = Settings::default();
+        // The macOS report this fixes: models moved out of the app bundle into a
+        // custom root, 0.6B pointed at it, then a size switch threw the path back
+        // to the install layout and the choice was gone for good.
+        //
+        // 路径用 join 构造（AGENTS.md 的跨平台规矩）：写死 r"C:\custom-models\..."
+        // 在 Linux 上只是一个相对文件名，这条断言测的就不是「用户挑的目录」了。
+        let custom = std::env::temp_dir()
+            .join("custom-models")
+            .join("Qwen3-ASR-0.6B-hf");
+        s.set_asr_dir(custom.clone());
+        assert_eq!(s.asr_model_dir, custom);
+
+        s.select_asr_model(ModelId::Qwen3Asr17B);
+        // Nothing was ever chosen for 1.7B, so the install layout answers…
+        assert!(s.asr_model_dir.to_string_lossy().contains(QWEN3_ASR_17B));
+        // …but switching back must restore 0.6B's own folder.
+        s.select_asr_model(ModelId::Qwen3Asr06B);
+        assert_eq!(s.asr_model_dir, custom);
+    }
+
+    #[test]
+    fn no_sibling_lookup_the_install_layout_is_the_only_default() {
+        // A custom root for 0.6B says nothing about 1.7B: with no pick of its
+        // own, 1.7B gets the install layout — never the folder next door.
+        let root = std::env::temp_dir().join(format!("oneasr_no_sibling_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(QWEN3_ASR_06B)).unwrap();
+        std::fs::create_dir_all(root.join(QWEN3_ASR_17B)).unwrap();
+
+        let mut s = Settings::default();
+        s.set_asr_dir(root.join(QWEN3_ASR_06B));
+        s.select_asr_model(ModelId::Qwen3Asr17B);
+        assert!(
+            s.asr_model_dir.to_string_lossy().contains(QWEN3_ASR_17B),
+            "{}",
+            s.asr_model_dir.display()
+        );
+        assert!(
+            !s.asr_model_dir.starts_with(&root),
+            "must not reach into the 0.6B root: {}",
+            s.asr_model_dir.display()
+        );
+        // A lookup is not a decision: nothing is written for 1.7B.
+        assert!(!s.asr_dirs.contains_key(QWEN3_ASR_17B), "{:?}", s.asr_dirs);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_asr_dir_is_verbatim_and_keeps_the_active_size() {
+        // WYSIWYG: the pick is stored and loaded exactly as given, and it
+        // binds to the size that was active — a folder named after the other
+        // size must not hijack the selection.
+        let mut s = Settings::default();
+        assert_eq!(s.selected_asr_id(), ModelId::Qwen3Asr06B);
+        let picked = PathBuf::from(r"D:\my-models\Qwen3-ASR-1.7B-hf");
+        let id = s.set_asr_dir(picked.clone());
+        assert_eq!(id, ModelId::Qwen3Asr06B);
+        assert_eq!(s.selected_asr_id(), ModelId::Qwen3Asr06B);
+        assert_eq!(s.asr_model_dir, picked);
+        assert_eq!(s.asr_dirs.get(QWEN3_ASR_06B), Some(&picked));
+    }
+
+    #[test]
+    fn picking_the_install_layout_dir_clears_the_pick() {
+        // Pointing a size back at the install layout is "no pick" — the entry
+        // must go, or the config pins this machine's absolute path.
+        let mut s = Settings::default();
+        let custom = PathBuf::from(r"D:\my-models\Qwen3-ASR-0.6B-hf");
+        s.set_asr_dir(custom);
+        assert!(s.asr_dirs.contains_key(QWEN3_ASR_06B));
+
+        s.set_asr_dir(default_asr_model_dir());
+        assert!(!s.asr_dirs.contains_key(QWEN3_ASR_06B), "{:?}", s.asr_dirs);
+        assert_eq!(s.asr_model_dir, default_asr_model_dir());
+    }
+
+    #[test]
+    fn normalize_migrates_the_old_root_pick_to_the_resolved_folder() {
+        // The pre-1.0.3 shape: `asr_dirs` holds the picked root while
+        // `asr_model_dir` holds the sibling resolved from it. The entry is
+        // rewritten to the folder so the pick keeps meaning what was chosen.
+        let root = std::env::temp_dir().join(format!("oneasr_migrate_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let folder = root.join(QWEN3_ASR_06B);
+        std::fs::create_dir_all(&folder).unwrap();
+
+        let mut s = Settings::default();
+        s.asr_dirs.insert(QWEN3_ASR_06B.to_string(), root.clone());
+        s.asr_model_dir = folder.clone();
+        s.normalize();
+        assert_eq!(s.asr_dirs.get(QWEN3_ASR_06B), Some(&folder));
+        assert_eq!(s.asr_model_dir, folder);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn normalize_seeds_a_legacy_custom_dir_instead_of_clobbering_it() {
+        // A config from before `asr_dirs` existed: one hand-picked folder
+        // with no catalog name. It survives the upgrade instead of being
+        // reset to the install layout.
+        let custom = std::env::temp_dir().join(format!("oneasr_legacy_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&custom);
+        std::fs::create_dir_all(&custom).unwrap();
+
+        let mut s = Settings::default();
+        s.asr_dirs.clear();
+        s.asr_model_dir = custom.clone();
+        s.normalize();
+        assert_eq!(s.asr_dirs.get(QWEN3_ASR_06B), Some(&custom));
+        assert_eq!(s.asr_model_dir, custom);
+
+        let _ = std::fs::remove_dir_all(&custom);
+    }
+
+    #[test]
+    fn install_layout_defaults_stay_out_of_the_config() {
+        // Storing the default would pin this machine's absolute path (the macOS
+        // install lives inside the .app), so only hand-picked folders are kept.
+        let mut s = Settings::default();
+        s.normalize();
+        assert!(s.asr_dirs.is_empty(), "{:?}", s.asr_dirs);
+
+        s.set_asr_dir(default_asr_model_dir());
+        assert!(s.asr_dirs.is_empty(), "{:?}", s.asr_dirs);
+    }
+
+    #[test]
+    fn default_chunk_target_is_product_default() {
+        assert_eq!(
+            Settings::default().chunk_target_seconds,
+            CHUNK_TARGET_DEFAULT_SEC
+        );
+        assert_eq!(CHUNK_TARGET_DEFAULT_SEC, 60);
+    }
+
+    #[test]
+    fn normalize_clamps_chunk_target_seconds() {
+        let mut s = Settings {
+            chunk_target_seconds: 10,
+            ..Settings::default()
+        };
+        s.normalize();
+        assert_eq!(s.chunk_target_seconds, CHUNK_TARGET_MIN_SEC);
+        s.chunk_target_seconds = 200;
+        s.normalize();
+        assert_eq!(s.chunk_target_seconds, CHUNK_TARGET_MAX_SEC);
+        s.chunk_target_seconds = 90;
+        s.normalize();
+        assert_eq!(s.chunk_target_seconds, 90);
+    }
+
+    #[test]
+    fn presets_are_within_legal_range() {
+        for &(sec, label) in CHUNK_TARGET_PRESETS {
+            assert_eq!(label, sec.to_string());
+            assert_eq!(clamp_chunk_target_seconds(sec), sec);
+        }
+    }
+
+    #[test]
+    fn default_output_dir_ends_with_output() {
+        let s = Settings::default();
+        assert!(
+            s.output_dir.file_name().is_some_and(|n| n == "output"),
+            "default output_dir should be …/output, got {}",
+            s.output_dir.display()
+        );
+    }
+
+    #[test]
+    fn normalize_fills_empty_output_dir() {
+        let mut s = Settings {
+            output_dir: PathBuf::new(),
+            ..Settings::default()
+        };
+        s.normalize();
+        assert!(!s.output_dir.as_os_str().is_empty());
+        assert_eq!(s.resolved_output_dir(), s.output_dir);
+    }
+
+    #[test]
+    fn default_saves_next_to_source() {
+        assert!(Settings::default().save_next_to_source);
+    }
+
+    #[test]
+    fn srt_target_dir_uses_media_parent() {
+        // 路径用 join 构造：写死 r"D:\Movies\lecture.mp4" 的话，Linux 上它没有
+        // 分隔符、`parent()` 返回空，这条测试根本走不到「用父目录」那个分支，
+        // 变成在验「Windows 路径在 Linux 上没有父目录」。
+        let movies = std::env::temp_dir().join("Movies");
+        let s = Settings {
+            output_dir: std::env::temp_dir().join("App").join("output"),
+            ..Settings::default()
+        };
+        assert_eq!(s.srt_target_dir(&movies.join("lecture.mp4")), movies);
+    }
+
+    #[test]
+    fn srt_target_dir_falls_back_without_parent() {
+        // 输出目录用绝对路径（temp_dir 下），否则 resolved_output_dir() 会把它
+        // 相对当前目录补全，期望值就随 cwd 漂移。
+        let out = std::env::temp_dir().join("App").join("output");
+        let s = Settings {
+            output_dir: out.clone(),
+            ..Settings::default()
+        };
+        // Bare file name has no usable parent dir → configured output dir.
+        assert_eq!(s.srt_target_dir(Path::new("lecture.mp4")), out);
+    }
+
+    #[test]
+    fn srt_target_dir_respects_output_dir_mode() {
+        let out = std::env::temp_dir().join("App").join("output");
+        let s = Settings {
+            save_next_to_source: false,
+            output_dir: out.clone(),
+            ..Settings::default()
+        };
+        let media = std::env::temp_dir().join("Movies").join("lecture.mp4");
+        assert_eq!(s.srt_target_dir(&media), out);
+    }
+
+    #[test]
+    fn normalize_absolutizes_relative_output_dir() {
+        let mut s = Settings {
+            output_dir: PathBuf::from("output"),
+            ..Settings::default()
+        };
+        s.normalize();
+        assert!(
+            s.output_dir.is_absolute(),
+            "expected absolute, got {}",
+            s.output_dir.display()
+        );
+        assert!(
+            s.output_dir.file_name().is_some_and(|n| n == "output"),
+            "expected …/output, got {}",
+            s.output_dir.display()
+        );
+        assert_eq!(s.resolved_output_dir(), s.output_dir);
+    }
+
+    #[test]
+    fn default_aligner_decision_prefers_qwen_unless_only_ctc_exists() {
+        use ModelId::OmniAsrCtc300M as Ctc;
+        use ModelId::QwenAlignUltra as Qwen;
+        assert_eq!(decide_default_aligner(false, false), Qwen);
+        // CTC is the fallback only when it is the one that exists.
+        assert_eq!(decide_default_aligner(true, false), Ctc);
+        assert_eq!(decide_default_aligner(true, true), Qwen);
+        assert_eq!(decide_default_aligner(false, true), Qwen);
+    }
+
+    #[test]
+    fn aligner_selection_keeps_per_model_dirs() {
+        let mut s = Settings {
+            aligner_model: ModelId::OmniAsrCtc300M.as_str().into(),
+            ..Settings::default()
+        };
+        assert!(!s.aligner_strips_punctuation());
+
+        let ctc_custom =
+            std::env::temp_dir().join(format!("oneasr_ctc_dir_{}", std::process::id()));
+        let qwen_custom =
+            std::env::temp_dir().join(format!("oneasr_qwen_dir_{}", std::process::id()));
+        s.set_aligner_dir(ctc_custom.clone());
+        assert_eq!(s.selected_aligner_id(), ModelId::OmniAsrCtc300M);
+        s.select_aligner_model(ModelId::QwenAlignUltra);
+        assert!(s.aligner_strips_punctuation());
+        s.set_aligner_dir(qwen_custom.clone());
+        assert_eq!(s.selected_aligner_id(), ModelId::QwenAlignUltra);
+
+        // Switching back restores each model's own pick.
+        s.select_aligner_model(ModelId::OmniAsrCtc300M);
+        assert_eq!(s.aligner_model_dir, ctc_custom);
+        s.select_aligner_model(ModelId::QwenAlignUltra);
+        assert_eq!(s.aligner_model_dir, qwen_custom);
+        assert_eq!(s.aligner_dirs.len(), 2);
+
+        let _ = std::fs::remove_dir_all(ctc_custom);
+        let _ = std::fs::remove_dir_all(qwen_custom);
+    }
+
+    /// 默认值必须自洽：引擎 id 与目录指向**同一个**模型。不自洽时 GUI 会点着
+    /// CTC 的按钮、把权重下进 Qwen 目录，再按 Qwen 的文件表校验并报「不完整」。
+    #[test]
+    fn default_settings_pair_the_aligner_id_with_its_dir() {
+        let s = Settings::default();
+        let id = s.selected_aligner_id();
+        assert_eq!(id, ModelId::default_aligner());
+        assert_eq!(s.aligner_model_dir, resolve_model_dir(id.as_str()));
+        // 标点恢复的分流也跟着同一个 id 走，不看目录。
+        assert_eq!(
+            s.aligner_strips_punctuation(),
+            id == ModelId::QwenAlignUltra
+        );
+    }
+
+    /// 老配置（无 `aligner_model` 字段）里手挑的目录必须在升级后活下来，
+    /// 两种目录名都要保：catalog 原名按号入座，自改名归给决策选中的模型。
+    /// 目录名认不出来时若直接丢路径，升级用户就得重新找一遍权重。
+    #[test]
+    fn legacy_aligner_dir_survives_normalize_under_any_folder_name() {
+        // 目录必须是**真实存在**的：不存在时 `repair_stale_model_dir` 会按设计
+        // 回退到布局默认，测的就不是「保住手挑路径」这条规则了。
+        let root =
+            std::env::temp_dir().join(format!("oneasr_aligner_legacy_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for name in [QWEN_ALIGN_ULTRA, QWEN_ALIGN_LEGACY, "my-own-aligner"] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let mut s: Settings =
+                serde_json::from_str(r#"{"language":"zh"}"#).expect("legacy config parses");
+            s.aligner_model_dir = dir.clone();
+            s.normalize();
+
+            // 归属：认得出 catalog 名就对号，否则归给这次决策选中的模型。
+            let owner =
+                ModelId::try_from_aligner_dir(&dir).unwrap_or_else(|| s.selected_aligner_id());
+            assert_eq!(
+                s.aligner_dirs.get(owner.as_str()),
+                Some(&dir),
+                "{name} 的目录没被记进 aligner_dirs：{:?}",
+                s.aligner_dirs
+            );
+            // 选中的正是那个模型时，派生目录就是它自己挑的那个。
+            if owner == s.selected_aligner_id() {
+                assert_eq!(s.aligner_model_dir, dir);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 旧版把 Qwen 对齐器写成 `Qwen3-ForcedAligner-0.6B-hf`：active id、
+    /// 布局目录和 per-model 键都可能是旧名。改名后一次迁到 Ultra，且旧布局
+    /// 默认路径不能被记成 Ultra 的「手挑」。
+    #[test]
+    fn legacy_qwen_aligner_name_migrates_to_ultra() {
+        let root =
+            std::env::temp_dir().join(format!("oneasr_aligner_rename_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let custom = root.join("my-ultra");
+        std::fs::create_dir_all(&custom).unwrap();
+
+        // active id 旧名 + 手挑目录：保留路径，归到 Ultra。
+        let mut s = Settings {
+            aligner_model: QWEN_ALIGN_LEGACY.into(),
+            aligner_model_dir: custom.clone(),
+            ..Settings::default()
+        };
+        s.normalize();
+        assert_eq!(s.aligner_model, ModelId::QwenAlignUltra.as_str());
+        assert_eq!(s.aligner_model_dir, custom);
+        assert_eq!(
+            s.aligner_dirs.get(ModelId::QwenAlignUltra.as_str()),
+            Some(&custom)
+        );
+        assert!(!s.aligner_dirs.contains_key(QWEN_ALIGN_LEGACY));
+
+        // active id 旧名 + 旧布局默认：目录落到新布局，不记成手挑。
+        let mut s = Settings {
+            aligner_model: QWEN_ALIGN_LEGACY.into(),
+            aligner_model_dir: resolve_model_dir(QWEN_ALIGN_LEGACY),
+            ..Settings::default()
+        };
+        s.normalize();
+        assert_eq!(s.aligner_model, ModelId::QwenAlignUltra.as_str());
+        assert_eq!(s.aligner_model_dir, resolve_model_dir(QWEN_ALIGN_ULTRA));
+        assert!(s.aligner_dirs.is_empty(), "{:?}", s.aligner_dirs);
+
+        // 旧 per-model 键（即使当前选的是 CTC）也要迁到 Ultra 名下。
+        let mut s = Settings {
+            aligner_model: ModelId::OmniAsrCtc300M.as_str().into(),
+            aligner_dirs: BTreeMap::from([(QWEN_ALIGN_LEGACY.to_string(), custom.clone())]),
+            ..Settings::default()
+        };
+        s.normalize();
+        assert_eq!(
+            s.aligner_dirs.get(ModelId::QwenAlignUltra.as_str()),
+            Some(&custom)
+        );
+        assert!(!s.aligner_dirs.contains_key(QWEN_ALIGN_LEGACY));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_settings_without_aligner_fields_parse_and_decide() {
+        let json = r#"{"language": "zh"}"#;
+        let mut s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.aligner_model, "");
+        s.normalize();
+        // 决策落回配置里成为显式 catalog id，且 id 与目录仍然配平。
+        let id = ModelId::try_parse_aligner(&s.aligner_model).expect("decision persisted");
+        assert!(id.kind() == ModelKind::Align);
+        // 布局目录不是用户挑的（这台机器上没挑过），所以不占 `aligner_dirs`。
+        assert!(s.aligner_dirs.is_empty(), "{:?}", s.aligner_dirs);
+    }
+
+    #[test]
+    fn repair_stale_model_dir_switches_when_default_exists() {
+        let tmp = std::env::temp_dir();
+        // default exists (temp_dir is a real directory)
+        let mut current = PathBuf::from(r"D:\__no_such_dir_for_test__");
+        let mut notes = Vec::new();
+        repair_stale_model_dir(&mut current, tmp.clone(), &mut notes);
+        assert_eq!(current, tmp, "stale path should switch to existing default");
+        assert_eq!(notes.len(), 1, "switch must be recorded: {notes:?}");
+    }
+
+    #[test]
+    fn repair_stale_model_dir_keeps_custom_path_when_neither_exists() {
+        let mut current = PathBuf::from(r"D:\__custom_model_path__");
+        let default = PathBuf::from(r"D:\__also_missing__");
+        let original = current.clone();
+        let mut notes = Vec::new();
+        repair_stale_model_dir(&mut current, default, &mut notes);
+        assert_eq!(
+            current, original,
+            "custom path should be preserved when neither exists"
+        );
+        assert!(notes.is_empty(), "no-op repair must not record: {notes:?}");
+    }
+
+    #[test]
+    fn repair_stale_model_dir_keeps_existing_path() {
+        let tmp = std::env::temp_dir();
+        let mut current = tmp.clone();
+        let default = PathBuf::from(r"D:\__no_such_dir__");
+        let mut notes = Vec::new();
+        repair_stale_model_dir(&mut current, default, &mut notes);
+        assert_eq!(current, tmp, "existing path should not be changed");
+        assert!(notes.is_empty(), "no-op repair must not record: {notes:?}");
+    }
+
+    /// 存进配置的目录，原样取回：用户挑哪个目录，就加载哪个目录。
+    ///
+    /// 这条不变式（WYSIWYG）是 `asr_dir_for` / `aligner_dir_for` 的核心承诺：
+    /// 加载路径不许被「猜」出来。之前在这里给相对 pick 加过一层「按模型根
+    /// 绝对化」，结果把用户挑的相对目录改写成了另一个目录 —— Linux CI 上
+    /// `each_asr_size_keeps_its_own_dir` 变红才把它揪出来。
+    ///
+    /// 相对 pick 的含义本来就是**有歧义的**（相对于谁？），与其悄悄猜一个
+    /// 解释，不如原样加载：猜错了用户看到的是「模型未就绪」，而改写了目录
+    /// 用户看到的是「加载了一个我没挑过的目录」——后者更难查。
+    ///
+    /// 界面上要显示全路径，那是**显示层**的事：壳显示 CLI `status --json` 里
+    /// 已经解析好的那个目录，不让 core 替用户改配置。
+    #[test]
+    fn a_stored_pick_is_returned_verbatim() {
+        let mine = std::env::temp_dir().join("oneasr-my-weights");
+        let s = Settings {
+            aligner_dirs: BTreeMap::from([(QWEN_ALIGN_ULTRA.to_string(), mine.clone())]),
+            asr_dirs: BTreeMap::from([(QWEN3_ASR_06B.to_string(), mine.clone())]),
+            ..Settings::default()
+        };
+        assert_eq!(s.aligner_dir_for(ModelId::QwenAlignUltra), mine);
+        assert_eq!(s.asr_dir_for(ModelId::Qwen3Asr06B), mine);
+    }
+
+    #[test]
+    fn load_report_is_notable_reflects_errors() {
+        // The report contract, without touching the real settings file on disk:
+        // any recorded error/repair is notable, a clean load is not.
+        let report = SettingsLoadReport {
+            config_path: Some(PathBuf::from("unused.json")),
+            parse_error: Some("test".into()),
+            ..SettingsLoadReport::default()
+        };
+        assert!(report.is_notable());
+        let clean = SettingsLoadReport::default();
+        assert!(!clean.is_notable());
+    }
+
+    /// 候选顺序：数据目录优先、安装目录兜底；两处同路径只读一次。
+    #[test]
+    fn read_candidates_prefers_data_dir_then_legacy() {
+        let data = PathBuf::from(r"D:\data\settings.json");
+        let legacy = PathBuf::from(r"D:\app\settings.json");
+        assert_eq!(
+            Settings::read_candidates(&Some(data.clone()), &legacy),
+            vec![data.clone(), legacy.clone()]
+        );
+        // 便携布局：两处其实是同一个文件，只读一次。
+        assert_eq!(
+            Settings::read_candidates(&Some(data.clone()), &data),
+            vec![data.clone()]
+        );
+        // 数据目录解析不出来（既无写权限又无平台用户目录）时，只剩安装目录兜底。
+        assert_eq!(Settings::read_candidates(&None, &legacy), vec![legacy]);
+    }
+
+    /// 临时目录里造一对 `(数据目录 settings.json, 安装目录 settings.json)`。
+    fn scratch_settings_pair(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("oneasr_{label}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data").join(paths::SETTINGS_FILE);
+        let legacy = root.join("install").join(paths::SETTINGS_FILE);
+        (root, data, legacy)
+    }
+
+    fn write_settings(path: &Path, secs: u32) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let s = Settings {
+            chunk_target_seconds: secs,
+            ..Settings::default()
+        };
+        std::fs::write(path, serde_json::to_string(&s).unwrap()).unwrap();
+    }
+
+    /// 数据目录里没有 `settings.json`（老用户升级，或安装目录后来变只读）→
+    /// 仍读到安装目录里那一份，"老数据不丢"。
+    #[test]
+    fn load_falls_back_to_install_settings() {
+        let (root, data, legacy) = scratch_settings_pair("settings_legacy");
+        write_settings(&legacy, 90);
+        // `data` 故意不创建：读它必然 NotFound，候选要顺延到 legacy。
+
+        let mut report = SettingsLoadReport::default();
+        let candidates = Settings::read_candidates(&Some(data), &legacy);
+        let loaded = Settings::load_first_of(&candidates, &mut report).expect("legacy settings");
+        assert_eq!(loaded.chunk_target_seconds, 90);
+        assert_eq!(report.config_path.as_deref(), Some(legacy.as_path()));
+        assert!(report.found, "读到安装目录那份也算 found");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 两份都在 → 数据目录那份优先（写入也只走那里，安装目录那份不动）。
+    #[test]
+    fn load_prefers_data_dir_settings_over_install_copy() {
+        let (root, data, legacy) = scratch_settings_pair("settings_both");
+        write_settings(&legacy, 30);
+        write_settings(&data, 120);
+
+        let mut report = SettingsLoadReport::default();
+        let candidates = Settings::read_candidates(&Some(data.clone()), &legacy);
+        let loaded = Settings::load_first_of(&candidates, &mut report).expect("data settings");
+        assert_eq!(loaded.chunk_target_seconds, 120);
+        assert_eq!(report.config_path.as_deref(), Some(data.as_path()));
+        assert!(report.found);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn output_formats_never_end_up_all_off() {
+        let mut s = Settings {
+            output_srt: false,
+            output_txt: false,
+            ..Settings::default()
+        };
+        let mut notes = Vec::new();
+        s.normalize_with_notes(&mut notes);
+        assert!(s.output_srt, "SRT must come back when everything is off");
+        assert!(!s.output_txt);
+        assert!(
+            notes.iter().any(|n| n.contains("output format")),
+            "repair should be reported: {notes:?}"
+        );
+
+        // TXT-only is a legal choice and must survive normalization.
+        let mut txt_only = Settings {
+            output_srt: false,
+            output_txt: true,
+            ..Settings::default()
+        };
+        txt_only.normalize();
+        assert!(!txt_only.output_srt);
+        assert!(txt_only.output_txt);
+
+        // ASS alone is a legal choice too — it carries the same cues as the SRT.
+        let mut ass_only = Settings {
+            output_srt: false,
+            output_txt: false,
+            output_ass: true,
+            ..Settings::default()
+        };
+        ass_only.normalize();
+        assert!(ass_only.output_ass, "ASS-only must survive normalization");
+        assert!(!ass_only.output_srt);
+    }
+
+    #[test]
+    fn text_script_defaults_to_original_and_repairs_unknown() {
+        assert_eq!(
+            Settings::default().text_script_choice(),
+            TextScript::Original,
+            "fresh installs must not re-write the model's script"
+        );
+
+        let mut s = Settings {
+            text_script: "zh-Hant".into(),
+            ..Settings::default()
+        };
+        s.normalize();
+        assert_eq!(s.text_script, TextScript::TRADITIONAL_ID);
+        assert_eq!(s.text_script_choice(), TextScript::Traditional);
+
+        s.text_script = "wat".into();
+        s.normalize();
+        assert_eq!(s.text_script, TextScript::ORIGINAL_ID);
+    }
+
+    #[test]
+    fn script_scope_is_chinese_only() {
+        let s = Settings {
+            text_script: TextScript::TRADITIONAL_ID.into(),
+            ..Settings::default()
+        };
+        assert_eq!(s.text_script_for("zh"), Some(TextScript::Traditional));
+        assert_eq!(s.text_script_for("yue"), Some(TextScript::Traditional));
+        assert_eq!(s.text_script_for("ja"), None);
+        assert_eq!(s.text_script_for("en"), None);
+    }
+
+    #[test]
+    fn demucs_dir_defaults_under_models_and_repairs_empty() {
+        let default = crate::model::default_demucs_model_dir();
+        let mut s = Settings::default();
+        assert!(
+            s.resolved_demucs_model_dir().ends_with("htdemucs_ft"),
+            "default dir should be the install-layout folder: {}",
+            s.resolved_demucs_model_dir().display()
+        );
+
+        s.demucs_model_dir = PathBuf::new();
+        s.normalize();
+        // 修复只在「默认目录确实存在」时发生 —— 这是刻意的：默认目录
+        // 不存在时保留空值，好过替用户编一个不存在的路径。因此按默认
+        // 目录是否存在分别断言 —— 不能假设它一定在：CI 的 checkout 里
+        // models/ 被 .gitignore 了，没有 htdemucs_ft，写死会在 Linux 上失败。
+        if default.is_dir() {
+            assert_eq!(
+                s.demucs_model_dir, default,
+                "默认目录存在时，空值应被修复成它"
+            );
+        } else {
+            assert!(
+                s.demucs_model_dir.as_os_str().is_empty(),
+                "默认目录不存在时不应凭空造路径: {:?}",
+                s.demucs_model_dir
+            );
+        }
+        // 无论走哪条分支，读出来的都必须落在 htdemucs_ft 上（空值回落到默认）。
+        assert!(
+            s.resolved_demucs_model_dir().ends_with("htdemucs_ft"),
+            "resolved dir should fall back to the install-layout folder: {}",
+            s.resolved_demucs_model_dir().display()
+        );
+    }
+
+    #[test]
+    fn vocal_separation_defaults_off() {
+        let mut s = Settings::default();
+        assert!(!s.vocal_separation, "sep must be opt-in");
+        // Point at a missing dir so the gate is deterministic on any machine.
+        s.asr_model_dir = PathBuf::from(r"D:\__oneasr_no_such_asr_dir__");
+        assert!(s.can_start().is_err(), "missing ASR dir must fail the gate");
+    }
+
+    #[test]
+    fn sound_switch_defaults_on_and_normalize_keeps_it() {
+        let s = Settings::default();
+        assert!(s.sound, "sounds ship on");
+
+        let mut off = Settings {
+            sound: false,
+            ..Settings::default()
+        };
+        off.normalize();
+        assert!(!off.sound, "normalize must not re-enable sounds");
+    }
+
+    #[test]
+    fn legacy_settings_without_sound_field_stay_audible() {
+        // Upgrading must not silently silence an existing install: the field is
+        // `#[serde(default)]`, so an old settings.json keeps sounds on.
+        let parsed: Settings =
+            serde_json::from_str(r#"{"language":"en"}"#).expect("legacy config parses");
+        assert!(parsed.sound, "missing sound must default to on");
+    }
+
+    #[test]
+    fn a_muted_install_is_not_unmuted_by_the_merged_switch() {
+        // 0.1.9 had two switches. Either one being off means the user wanted
+        // quiet, and merging them must not hand the noise back.
+        let mut muted: Settings =
+            serde_json::from_str(r#"{"language":"zh","ui_sound":false,"task_notify":true}"#)
+                .expect("0.1.9 config parses");
+        muted.normalize();
+        assert!(!muted.sound, "关过的音效不能被合并开关重新打开");
+        assert!(
+            muted.legacy_ui_sound.is_none() && muted.legacy_task_notify.is_none(),
+            "legacy keys stop round-tripping after the first load"
+        );
+
+        // Both on (or neither present) keeps the shipped default.
+        let mut loud: Settings =
+            serde_json::from_str(r#"{"language":"zh","ui_sound":true,"task_notify":true}"#)
+                .expect("0.1.9 config parses");
+        loud.normalize();
+        assert!(loud.sound);
+
+        // The new switch itself is never overridden by anything.
+        let mut off: Settings = serde_json::from_str(r#"{"language":"zh","sound":false}"#)
+            .expect("0.2.0 config parses");
+        off.normalize();
+        assert!(!off.sound);
+    }
+
+    #[test]
+    fn welcome_card_shows_only_on_fresh_installs() {
+        // 全新安装：连 settings.json 都没有，落 Settings::default() —— 要弹欢迎卡。
+        assert!(!Settings::default().welcome_done);
+        // 升级用户：旧配置没有这个字段，serde 字段默认必须落 true —— 别让人
+        // 升个级再看一遍欢迎卡。
+        let legacy: Settings =
+            serde_json::from_str(r#"{"language":"zh"}"#).expect("legacy config parses");
+        assert!(legacy.welcome_done);
+        // 看过一次就永远不再弹：显式写进配置的值要原样往返（save/load 不改它）。
+        let seen = Settings {
+            welcome_done: true,
+            ..Settings::default()
+        };
+        let text = serde_json::to_string(&seen).unwrap();
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert!(back.welcome_done);
+        // normalize 不掺和：它只修「非法」值，看没看过欢迎卡没有非法态。
+        let mut kept = back;
+        kept.normalize();
+        assert!(kept.welcome_done);
+    }
+}

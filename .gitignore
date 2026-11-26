@@ -1,0 +1,54 @@
+/target
+/runs
+/output
+# Bundled ffmpeg（约 60–100 MB）只本地存在，从不入库：Windows 用 bin/ffmpeg.exe，
+# Linux/macOS 用无扩展名的 bin/ffmpeg。整个目录忽略、只放行占位文件，
+# 免得哪天多出一个平台的文件就被误提交。
+/bin/*
+!/bin/.gitkeep
+# Downloaded ASR/aligner weights (multi-GB; never commit)
+/models
+# CUDA DLLs installed next to the exe / into dll/
+/dll
+# User preferences (local machine paths)
+/settings.json
+# 用户自己的热词库（词表 + 组名），与 settings.json 同目录、同性质：
+# 开发期从仓库目录直接跑（app_root = 仓库根）会落在这里，别误提交
+/hotword.json
+# Usage ledger written next to settings.json (numbers only, per machine)
+/stats.jsonl
+# Crash/error log written next to the exe (rotated to .old)
+/oneasr-error.log
+/oneasr-error.log.old
+# 活动任务临时记录：失败时并入错误日志，成功时删除；
+# ONEASR_KEEP_JOURNAL=1 成功后改名保留，供诊断
+/oneasr-task-*.pending
+/oneasr-task-*.log
+# Release packaging output
+/dist
+/release
+# Forum drafts stay local (any `forum-post*.md` variant)
+/forum-post*.md
+# Local scratch: visual pages, HTML mockups, ad-hoc output (never committed)
+/tmp/
+# Local tooling workspace: scratch files, notes, audition material (never committed)
+/.workbuddy/
+# Icon gen intermediates
+assets/icons/_t*.png
+# scripts/ 下的 Python 校验脚本运行时的字节码缓存
+__pycache__/
+*.pyc
+**/*.rs.bk
+.DS_Store
+*.pdb
+# Local evaluation audio (large; keep manifest/README in git if desired)
+# 素材、术语清单与期望清单含版权/隐私（尤其交易领域），terms/ 与 cases/ 也不入库
+/testdata/terms/
+/testdata/cases/
+/testdata/clips/
+/testdata/refs/
+/testdata/gold/
+/testdata/hyps/
+/testdata/baselines/
+/testdata/_cache/
+/testdata/_compare*/

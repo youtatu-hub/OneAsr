@@ -1,0 +1,184 @@
+//! The concrete [`EngineProvider`] the pipeline is handed.
+
+use super::aligner::QwenAlignerAdapter;
+use super::backend::{
+    ComputeBackend, gpu_load_failure_msg, is_forced_gpu, resolve_compute_backend,
+};
+use super::ctc_aligner::CtcAlignerAdapter;
+use super::demucs::DemucsSeparatorAdapter;
+use super::qwen_asr::QwenAsrAdapter;
+use super::sensevoice::SenseVoiceRoughAdapter;
+use crate::model::ModelId;
+use std::cell::Cell;
+use std::path::PathBuf;
+
+#[cfg(debug_assertions)]
+use crate::diagnostics::pipeline_trace;
+use crate::diagnostics::trace_log;
+use crate::engine::{Aligner, AsrEngine, EngineError, EngineProvider, RoughAsr, Separator};
+use crate::settings::Settings;
+
+/// Real engines backed by local weights, with the product's backend policy.
+///
+/// The resolved backend is remembered after the ASR load: when a GPU load
+/// falls back to CPU, the aligner must follow (one policy per run).
+pub struct LocalEngineProvider {
+    asr_model_dir: PathBuf,
+    aligner_model_dir: PathBuf,
+    /// Which aligner engine the settings selected (`CTC` | `Qwen`).
+    aligner: ModelId,
+    demucs_model_dir: PathBuf,
+    /// 热词粗转（SenseVoice）的目录。只有选了热词组的运行才会读它。
+    rough_model_dir: PathBuf,
+    backend_pref: String,
+    resolved: Cell<ComputeBackend>,
+}
+
+impl LocalEngineProvider {
+    /// Resolve the compute backend for this run (cheap; no weights are read).
+    pub fn from_settings(settings: &Settings) -> Result<Self, EngineError> {
+        let resolved = resolve_compute_backend(&settings.backend)?;
+        let gpu = match super::backend::probe_gpu_device() {
+            Ok(p) => p.description.as_str(),
+            Err(_) => "none",
+        };
+        let summary = format!(
+            "setting={} resolved={} gpu={gpu}",
+            settings.backend,
+            resolved.label(),
+        );
+        trace_log(format!("backend {summary}"));
+        #[cfg(debug_assertions)]
+        if !pipeline_trace() {
+            eprintln!("[backend] {summary}");
+        }
+        Ok(Self {
+            asr_model_dir: settings.asr_model_dir.clone(),
+            aligner_model_dir: settings.aligner_model_dir.clone(),
+            aligner: settings.selected_aligner_id(),
+            demucs_model_dir: settings.resolved_demucs_model_dir(),
+            rough_model_dir: settings.resolved_sensevoice_model_dir(),
+            backend_pref: settings.backend.clone(),
+            resolved: Cell::new(resolved),
+        })
+    }
+
+    /// Backend currently in use (after any fallback).
+    pub fn resolved_backend(&self) -> &'static str {
+        self.resolved.get().label()
+    }
+
+    fn forced_gpu(&self) -> bool {
+        is_forced_gpu(&self.backend_pref)
+    }
+}
+
+impl LocalEngineProvider {
+    /// A pinned `ONEASR_DEVICE` that does not parse is a user error. Check it
+    /// before any CPU retry, so a typo cannot land on another GPU or on CPU.
+    fn reject_bad_device_pin(&self, check: Result<(), EngineError>) -> Result<(), EngineError> {
+        if self.resolved.get() == ComputeBackend::Cpu || !super::device::device_pinned() {
+            return Ok(());
+        }
+        check
+    }
+
+    fn open_aligner(&self, backend: ComputeBackend) -> Result<Box<dyn Aligner>, EngineError> {
+        match self.aligner {
+            ModelId::OmniAsrCtc300M => CtcAlignerAdapter::load(&self.aligner_model_dir, backend)
+                .map(|engine| {
+                    let summary = format!(
+                        "aligner backend={} device={}",
+                        engine.backend_name(),
+                        engine.device_desc()
+                    );
+                    trace_log(summary.clone());
+                    #[cfg(debug_assertions)]
+                    if !pipeline_trace() {
+                        eprintln!("[{summary}]");
+                    }
+                    Box::new(engine) as Box<dyn Aligner>
+                }),
+            _ => QwenAlignerAdapter::load(&self.aligner_model_dir, backend).map(|engine| {
+                let summary = format!(
+                    "aligner backend={} device={}",
+                    engine.backend_name(),
+                    engine.device_desc()
+                );
+                trace_log(summary.clone());
+                #[cfg(debug_assertions)]
+                if !pipeline_trace() {
+                    eprintln!("[{summary}]");
+                }
+                Box::new(engine) as Box<dyn Aligner>
+            }),
+        }
+    }
+}
+
+impl EngineProvider for LocalEngineProvider {
+    fn load_asr(&self) -> Result<Box<dyn AsrEngine>, EngineError> {
+        let dir = &self.asr_model_dir;
+        let first = self.resolved.get();
+        self.reject_bad_device_pin(super::device::asr_selector_from_env().map(|_| ()))?;
+        match QwenAsrAdapter::load(dir, first) {
+            Ok(engine) => {
+                trace_log(format!("asr device={}", engine.device_description()));
+                Ok(Box::new(engine))
+            }
+            // Pinned auto: that card failed. Retry CPU, not a different GPU.
+            Err(e) if first == ComputeBackend::Auto && super::device::device_pinned() => {
+                trace_log(format!("pinned gpu load failed, falling back to cpu: {e}"));
+                self.resolved.set(ComputeBackend::Cpu);
+                QwenAsrAdapter::load(dir, ComputeBackend::Cpu)
+                    .map(|engine| Box::new(engine) as Box<dyn AsrEngine>)
+            }
+            Err(e) if first == ComputeBackend::Gpu => {
+                Err(EngineError::new(gpu_load_failure_msg(&e)))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn load_aligner(&self) -> Result<Box<dyn Aligner>, EngineError> {
+        let backend = self.resolved.get();
+        let pin_ok = match self.aligner {
+            ModelId::OmniAsrCtc300M => super::device::ctc_selector_from_env().map(|_| ()),
+            _ => super::device::aligner_selector_from_env().map(|_| ()),
+        };
+        self.reject_bad_device_pin(pin_ok)?;
+        match self.open_aligner(backend) {
+            Ok(engine) => Ok(engine),
+            Err(e) if backend == ComputeBackend::Auto && super::device::device_pinned() => {
+                trace_log(format!(
+                    "pinned aligner gpu failed, falling back to cpu: {e}"
+                ));
+                self.resolved.set(ComputeBackend::Cpu);
+                self.open_aligner(ComputeBackend::Cpu)
+            }
+            Err(e) if backend == ComputeBackend::Gpu => {
+                Err(EngineError::new(gpu_load_failure_msg(&e)))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn load_separator(&self) -> Result<Box<dyn Separator>, EngineError> {
+        DemucsSeparatorAdapter::load(
+            &self.demucs_model_dir,
+            self.resolved.get(),
+            self.forced_gpu(),
+            trace_log,
+        )
+        .map(|engine| Box::new(engine) as Box<dyn Separator>)
+    }
+
+    fn load_rough_asr(&self) -> Result<Box<dyn RoughAsr>, EngineError> {
+        // 粗转跑在正式 ASR 之前，所以这里看到的是本次运行「已定下」的后端：
+        // 若本机已定成 CPU（钉卡失败回落），这趟也走 CPU，与「一次运行一套后端
+        // 策略」一致。粗转不做 GPU/CPU 之间的二次回落——加载失败就报错。
+        let engine = SenseVoiceRoughAdapter::load(&self.rough_model_dir, self.resolved.get())?;
+        trace_log(format!("rough device={}", engine.device_description()));
+        Ok(Box::new(engine))
+    }
+}

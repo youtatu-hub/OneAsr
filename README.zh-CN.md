@@ -1,0 +1,129 @@
+<div align="center">
+  <h1>OneAsr</h1>
+  <p>本地 · 离线 · 批量音视频 → SRT / ASS / TXT 字幕</p>
+  <p>Windows / Linux / macOS · 基于 Qwen3-ASR · 不上传云端</p>
+
+  [![GitHub stars](https://img.shields.io/github/stars/eclipse005/OneAsr?style=flat-square&logo=github&color=f59e0b)](https://github.com/eclipse005/OneAsr/stargazers) [![GitHub forks](https://img.shields.io/github/forks/eclipse005/OneAsr?style=flat-square&logo=github)](https://github.com/eclipse005/OneAsr/network/members) [![CI](https://img.shields.io/github/actions/workflow/status/eclipse005/OneAsr/ci.yml?branch=master&style=flat-square&label=ci)](https://github.com/eclipse005/OneAsr/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/eclipse005/OneAsr?style=flat-square&color=16a34a)](LICENSE)
+
+  [![Windows](https://img.shields.io/badge/Windows-x64-0078D6?style=flat-square&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI2ZmZiI%2BPHBhdGggZD0iTTAsMEgxMS4zNzdWMTEuMzcySDBaTTEyLjYyMywwSDI0VjExLjM3MkgxMi42MjNaTTAsMTIuNjIzSDExLjM3N1YyNEgwWm0xMi42MjMsMEgyNFYyNEgxMi42MjMiLz48L3N2Zz4%3D)](#下载安装) [![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-111111?style=flat-square&logo=apple&logoColor=white)](#下载安装) [![Linux](https://img.shields.io/badge/Linux-x86__64-FCC624?style=flat-square&logo=linux&logoColor=111111)](#下载安装)
+
+  [下载安装](#下载安装) · [快速上手](#快速上手) · [界面预览](#界面预览) · [CLI 命令行](#cli-命令行) · [Release](https://github.com/eclipse005/OneAsr/releases)
+
+  [English](README.md) · **简体中文**
+</div>
+
+## 工作原理
+
+全程在本机跑——不上传、不需要账号。
+
+| 模式 | 输入 | 管线 | 输出 |
+|---|---|---|---|
+| **转写** | 音视频 | VAD 分段 → Qwen3-ASR 转写 → 词级打轴（默认 Qwen）→ 智能断句 | SRT / ASS / TXT |
+| **文稿匹配** | 音视频 + 校对好的 .txt / .srt | CTC 对齐（跳过识别） | SRT / ASS |
+
+两种模式都可以先做人声分离（HTDemucs）。
+
+## 下载安装
+
+当前版本 **[v1.5.1](https://github.com/eclipse005/OneAsr/releases/tag/v1.5.1)**（点文件名即下载）：
+
+| 平台 | 下载 |
+|------|------|
+| Windows | [安装包](https://github.com/eclipse005/OneAsr/releases/download/v1.5.1/OneAsr_1.5.1_windows_setup.exe) · [便携包](https://github.com/eclipse005/OneAsr/releases/download/v1.5.1/OneAsr_1.5.1_windows_portable.zip) |
+| Linux x64 | [安装包](https://github.com/eclipse005/OneAsr/releases/download/v1.5.1/OneAsr_1.5.1_linux_x64.deb) · [便携包](https://github.com/eclipse005/OneAsr/releases/download/v1.5.1/OneAsr_1.5.1_linux_x64.tar.gz) |
+| macOS（M 芯片） | [磁盘映像](https://github.com/eclipse005/OneAsr/releases/download/v1.5.1/OneAsr_1.5.1_macos.dmg) |
+
+## 快速上手
+
+1. 运行主程序（Windows `oneasr.exe`，Linux / macOS `oneasr`）
+2. **设置** → 下载 **ASR**（建议先 0.6B）+ **对齐模型**（出 SRT / ASS 必需；只出 TXT 不需要）
+3. 选好源语言 → 添加音视频 → 开始
+4. 输出目录拿同名 `.srt`
+5. 已有校对好的文稿？添加文件时把它和视频一起选中再点开始——跳过识别直接打轴（输出 `视频名.aligned.srt`；先在设置里勾选 SRT 或 ASS）
+
+## 界面预览
+
+主界面与设置抽屉（并排同一尺寸）：
+
+| 主界面（空态） | 设置抽屉 |
+|---|---|
+| <img src="docs/images/main.png" width="420" alt="主界面空态" /> | <img src="docs/images/settings.png" width="420" alt="设置抽屉" /> |
+
+## 功能
+
+- **完全本地**：转写与对齐都在本机，下完模型可断网用
+- **批量队列**：一次丢多个文件，进度与阶段一目了然
+- **时间轴可靠**：词级对齐 + 智能断句，不是整段估时间
+- **文稿匹配**：已有校对好的文稿？挂上去直接跳过识别，每一行都有真实时间轴
+- **ASS 卡拉OK输出**：中日韩逐字（空格语言逐词）各带时间戳，播放器可做逐字高亮
+- **本地对齐**：两种对齐器都在本机跑，不依赖云端
+- **两个对齐器可选**：Qwen（默认，词级）与 CTC（帧同步），在设置里随时切换
+- **11 种语言**：中文普通话、English、粤语、日本語、한국어、Français、Deutsch、Italiano、Español、Português、Русский（需手动指定，不自动检测）
+- **双规格 ASR**：0.6B（更快 / 省显存）· 1.7B（更准 / 更吃资源）
+- **输出可选**：SRT / ASS / TXT 任意组合，默认与视频同目录
+- **仅转录**：只勾 TXT、不勾 SRT / ASS 时，任务转到转写为止——一行一句、按句末标点断句；完全不需要对齐模型
+- **简繁可选**：原文 / 简体 / 繁体（仅中文、粤语生效，不影响时间轴）
+- **人声分离（可选）**：转写前压掉 BGM / 噪声
+- **热词（可选）**：把总被听错的词（人名、品牌、术语）放进词表，转写就按你写的出；仅中文与英文（热词模型另下，约 940 MB）
+- **GPU 加速**：NVIDIA / AMD / Intel / Mac M 芯片；无独显自动走 CPU
+
+## 模型与体积
+
+安装包**不含**权重，首次在设置里从 ModelScope 下载（可断点续传）：
+
+| 组件 | 约体积 | 说明 |
+|------|--------|------|
+| Qwen3-ASR-0.6B-hf | ~1.6 GB | 默认推荐 |
+| Qwen3-ASR-1.7B-hf | ~4.1 GB | 更高精度 |
+| omniASR-CTC-300M-v2-hf | ~1.3 GB | 可选 —— 文稿匹配固定用它 |
+| Qwen3-ForcedAligner-Ultra | ~1.8 GB | 默认对齐器 —— 首次使用时下载 |
+| HTDemucs v4 人声权重 | ~84 MB | 可选 |
+| SenseVoiceSmall（热词模型） | ~940 MB | 可选 —— 用热词时才需要 |
+
+常用组合约 3.5～6.0 GB。仅下模型需要联网，转写过程可离线。
+
+## CLI 命令行
+
+安装包自带 `oneasr-cli`（与 GUI 同一条流水线），先用 GUI 下好模型（或 `oneasr-cli download --model 0.6b`）再调用：
+
+```powershell
+oneasr-cli.exe transcribe --input "video.mp4" --language zh --backend auto --output "out.srt"
+```
+
+`align` 挂文稿（`--text 文稿.txt`）打轴、不跑识别；`render` 从落盘的 `timeline.json` 免加载模型重渲染其它预设。`transcript inspect|split|polish` 在打轴之前读文稿 / 智能断句 / 美化；`status` 报模型就绪、`probe` 报文件的时长与类型；`--events=json` 输出逐行 JSON 进度。`--txt` 额外出 txt、`--script original|simplified|traditional` 切中文字形、`--vocal-separation` 先做人声分离、`--hotword-group <组名>` 用保存的热词组、`--hotwords <词表>` 直接给词表（仅中文 / 英文任务）。`--help` 看完整参数。
+
+## 配置要求
+
+- 系统：Windows 10 / 11、Linux、macOS（Apple Silicon）
+- 显卡：0.6B 推荐 4GB+ 显存，1.7B 建议 6GB+；无独显走 CPU（慢但可用）
+- 网络：仅首次下载模型需要
+- ffmpeg：发布包里已经带好了。**从源码自己编译**的话，两条路任选 —— 把
+  [ffmpeg 7.1.2](https://github.com/Tyrrrz/FFmpegBin/releases/tag/7.1.2) 里对应平台的
+  压缩包解开，把 `ffmpeg.exe`（Windows）或 `ffmpeg`（Linux / macOS）放进 `bin/`；
+  或者系统里已经装了 ffmpeg 就什么都不用做（程序先用 `bin/` 里那份，找不到再用 `PATH` 上的）
+
+## 提示
+
+- **语种选错**是最常见的翻车原因；粤语选「粤语」，其他中文方言一般选「中文普通话」
+- 带 BGM / 噪声先开「人声分离」，准得多
+- macOS 包未签名：dmg 里有「安装 OneAsr.command」+「安装说明.txt」，按说明装一次即可（说明里终端方式排在前面，任何版本都能用）
+- Linux 建议把 tar.gz 解压到用户目录
+- Linux 便携包首次使用运行 `bash install-desktop.sh`，注册应用图标和启动器（Linux 不会把图标嵌入 ELF 可执行文件）
+
+## 致谢
+
+首发与交流：[LINUX DO](https://linux.do/) · [吾爱破解](https://www.52pojie.cn/) · [小众软件论坛](https://meta.appinn.net/)
+
+## 许可
+
+- 本项目代码：**MIT**
+- 模型权重与协议以 [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) 及对应托管方为准
+- 引擎：[qwen3-asr-wgpu](https://github.com/eclipse005/qwen3-asr-wgpu) · [ctc-forced-aligner-wgpu](https://github.com/eclipse005/ctc-forced-aligner-wgpu) · [qwen3-aligner-wgpu](https://github.com/eclipse005/qwen3-aligner-wgpu) · [demucs-wgpu](https://github.com/eclipse005/demucs-wgpu)
+
+## 星标历史
+
+[![Star History Chart](https://api.star-history.com/svg?repos=eclipse005/OneAsr&type=Date)](https://star-history.com/#eclipse005/OneAsr&Date)
+
+<p align="center">
+  <sub>问题反馈请附系统版本、显卡与显存、所用模型（0.6B / 1.7B）与报错信息</sub>
+</p>

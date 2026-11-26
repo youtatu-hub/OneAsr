@@ -1,0 +1,2560 @@
+//! 界面双语（zh / en）机制 + 本 crate 内产生文案的双语表。
+//!
+//! 设计约束：
+//! - **零依赖、无 key 查找**：每条文案是成对的 [`Str`]，编译期保证 zh/en 同时存在；
+//!   取词用 [`t`]，当前语言是进程级状态（[`set_ui_lang`] / [`ui_lang`]）。
+//! - **管线自产的文案（错误、阶段名、下载进度、统计时长）集中在本文件**；
+//!   界面标签（按钮、区块标题）属于 GUI crate，在其自己的 `i18n` 模块里建表，
+//!   复用本模块的 [`Str`] 与 [`t`]。
+//! - **纯格式化函数显式接收 [`UiLang`] 参数**（如统计时长），不在函数内读全局，
+//!   这样单测无共享状态；全局只在渲染/动作边界与 `Display` 实现里读取。
+//! - 语言设置持久化在 [`crate::settings::Settings::ui_language`]
+//!   （`system` | `zh` | `en`），`system` 表示跟随系统（[`detect_system_lang`]）。
+
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// `Settings::ui_language`：跟随系统。
+pub const UI_LANGUAGE_SYSTEM: &str = "system";
+/// `Settings::ui_language`：中文。
+pub const UI_LANGUAGE_ZH: &str = "zh";
+/// `Settings::ui_language`：English。
+pub const UI_LANGUAGE_EN: &str = "en";
+
+/// 界面语言。文案只有中英两份，其他系统语言一律落到英文。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UiLang {
+    #[default]
+    Zh,
+    En,
+}
+
+impl UiLang {
+    /// 从 BCP-47 风格语言代码解析（`zh` / `zh-CN` / `en-US` / `C`…）。
+    /// 非 `zh*` 一律视为英文档。
+    pub fn from_code(code: &str) -> UiLang {
+        let lower = code.to_ascii_lowercase();
+        if lower.starts_with("zh") {
+            UiLang::Zh
+        } else {
+            UiLang::En
+        }
+    }
+
+    /// 存进 `Settings::ui_language` 的稳定值。
+    pub fn setting_value(self) -> &'static str {
+        match self {
+            UiLang::Zh => UI_LANGUAGE_ZH,
+            UiLang::En => UI_LANGUAGE_EN,
+        }
+    }
+}
+
+/// 当前界面语言：`0` = zh，`1` = en（默认中文，启动时由设置覆盖）。
+static UI_LANG: AtomicU8 = AtomicU8::new(0);
+
+/// 设置进程级界面语言（启动时与设置保存成功后调用）。
+pub fn set_ui_lang(lang: UiLang) {
+    UI_LANG.store(lang as u8, Ordering::Relaxed);
+}
+
+/// 读取进程级界面语言。渲染与文案构造边界使用；纯函数请改为显式传参。
+pub fn ui_lang() -> UiLang {
+    if UI_LANG.load(Ordering::Relaxed) == UiLang::En as u8 {
+        UiLang::En
+    } else {
+        UiLang::Zh
+    }
+}
+
+/// 一条双语文案。zh 与 en 必须成对书写，新增文案缺一不可。
+#[derive(Debug, Clone, Copy)]
+pub struct Str {
+    pub zh: &'static str,
+    pub en: &'static str,
+}
+
+impl Str {
+    pub const fn new(zh: &'static str, en: &'static str) -> Self {
+        Self { zh, en }
+    }
+
+    /// 显式语言取词：给不读全局语言的纯函数用。
+    ///
+    /// [`t`] 读进程级语言（渲染与文案构造边界用）；被单测引用的格式化函数
+    /// 必须显式收 `UiLang`（这样两种语言都能断言），那一类走这里。
+    pub fn get(self, lang: UiLang) -> &'static str {
+        match lang {
+            UiLang::Zh => self.zh,
+            UiLang::En => self.en,
+        }
+    }
+}
+
+/// 按当前界面语言取词。
+pub fn t(s: Str) -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => s.zh,
+        UiLang::En => s.en,
+    }
+}
+
+/// 归一化 `Settings::ui_language`：只允许 `system` / `zh` / `en`，
+/// 其余（含损坏值）回落 `system`。大小写与常见书写形式都能识别。
+pub fn normalize_ui_language(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "zh" | "zh-cn" | "zh-hans" => UI_LANGUAGE_ZH.into(),
+        "en" => UI_LANGUAGE_EN.into(),
+        _ => UI_LANGUAGE_SYSTEM.into(),
+    }
+}
+
+/// 探测系统语言（首次启动 `ui_language = "system"` 时用）。
+/// 探测失败时保守回退中文。
+pub fn detect_system_lang() -> UiLang {
+    match system_lang_code() {
+        Some(code) => UiLang::from_code(&code),
+        None => UiLang::Zh,
+    }
+}
+
+// ─── 管线自产文案的双语表 ────────────────────────────────────────────
+//
+// 这些消息在 core 内构造（错误 Display、阶段更新、下载进度、模型校验），
+// 构造时按进程当前语言定格。带参数的句子写成小函数；纯枚举标签在各自
+// 类型的 `label(UiLang)` 方法里。
+
+/// 模型角色名（模型校验 / 完整性错误共用）。
+pub const ROLE_ASR: Str = Str::new("语音识别", "ASR");
+/// 见 [`ROLE_ASR`]。
+pub const ROLE_ALIGNER: Str = Str::new("对齐", "Aligner");
+/// 见 [`ROLE_ASR`]。
+pub const ROLE_DEMUCS: Str = Str::new("人声分离", "Vocal separation");
+/// 见 [`ROLE_ASR`]。热词这一路的模型（SenseVoiceSmall，负责第一趟转录 + 召回）。
+pub const ROLE_HOTWORD: Str = Str::new("热词模型", "Hotword model");
+
+/// `热词组「{name}」还没有词，先加词或换一个组` /
+/// `Hotword group "{name}" is empty — add words or pick another group`。
+pub fn hotword_group_empty(name: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("热词组「{name}」还没有词，先加词或换一个组"),
+        UiLang::En => {
+            format!("Hotword group \"{name}\" is empty — add words or pick another group")
+        }
+    }
+}
+
+/// 保留的默认组（`id == "default"`）没起名时显示的占位名。
+pub const HOTWORD_GROUP_DEFAULT: Str = Str::new("默认", "Default");
+/// 用户新建、还没起名的组显示的占位名。
+pub const HOTWORD_GROUP_UNNAMED: Str = Str::new("未命名", "Untitled");
+
+/// 热词组没起名时的占位名（纯函数，显式收语言）。
+///
+/// **不用 `id` 兜底**：`default` / `g1` 是给任务绑定用的稳定标识，出现在 chip、
+/// 下拉和报错里，用户会以为「组名就叫 default」。
+pub fn hotword_group_placeholder(lang: UiLang, is_default: bool) -> &'static str {
+    let s = if is_default {
+        HOTWORD_GROUP_DEFAULT
+    } else {
+        HOTWORD_GROUP_UNNAMED
+    };
+    match lang {
+        UiLang::Zh => s.zh,
+        UiLang::En => s.en,
+    }
+}
+
+// ---- AsrError ----
+pub const ERR_IO: Str = Str::new("I/O 错误", "I/O error");
+pub const ERR_MEDIA: Str = Str::new("音频处理错误", "Audio processing error");
+pub const ERR_EMPTY_ALIGNMENT: Str =
+    Str::new("对齐后词列表为空", "Word list is empty after alignment");
+/// 见 [`ERR_EMPTY_ALIGNMENT`]。
+pub const ERR_EMPTY_TRANSCRIPT: Str = Str::new("文稿是空的", "Transcript is empty");
+/// SRT 块全被剥成了空行——文件在，但没有一条能当字幕的文字。
+pub const ERR_TRANSCRIPT_NO_CUES: Str =
+    Str::new("SRT 里没有可用的字幕行", "SRT has no usable subtitle lines");
+pub const ERR_TRANSCRIPT_REQUIRES_TIMED_OUTPUT: Str = Str::new(
+    "文稿匹配需要至少启用 SRT 或 ASS 输出",
+    "Transcript matching requires SRT or ASS output",
+);
+pub const ERR_EMPTY_SENTENCE_BOUNDARY: Str = Str::new(
+    "断句后字幕为空",
+    "Subtitle is empty after sentence segmentation",
+);
+/// TXT 不走断句・字幕那条链，空结果只说转写为空。
+pub const ERR_EMPTY_TXT_BODY: Str = Str::new(
+    "转写结果为空，没有可写出的文本",
+    "Transcription is empty; there is no text to write",
+);
+pub const ERR_READ_DURATION: Str = Str::new(
+    "无法读取转码后音频时长",
+    "Cannot read the converted audio duration",
+);
+pub const ERR_NO_OUTPUT_FORMAT: Str = Str::new("未启用任何输出格式", "No output format is enabled");
+
+/// `语音识别未产生任何有效文本（{n} 段全部为空）`
+/// / `Transcription produced no usable text ({n} segments, all empty)`。
+pub fn empty_transcribe(n: usize) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("语音识别未产生任何有效文本（{n} 段全部为空）"),
+        UiLang::En => format!("Transcription produced no usable text ({n} segments, all empty)"),
+    }
+}
+
+/// `加载语音识别模型失败: {e}` / `Failed to load the ASR model: {e}`。
+pub fn load_asr_failed(e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("加载语音识别模型失败: {e}"),
+        UiLang::En => format!("Failed to load the ASR model: {e}"),
+    }
+}
+
+/// `加载对齐模型失败: {e}` / `Failed to load the aligner model: {e}`。
+pub fn load_aligner_failed(e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("加载对齐模型失败: {e}"),
+        UiLang::En => format!("Failed to load the aligner model: {e}"),
+    }
+}
+
+/// `加载热词模型失败: {e}` / `Failed to load the hotword model: {e}`。
+pub fn load_rough_asr_failed(e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("加载热词模型失败: {e}"),
+        UiLang::En => format!("Failed to load the hotword model: {e}"),
+    }
+}
+
+/// `转写失败 chunk {i}: {e}` / `Transcription failed for chunk {i}: {e}`。
+pub fn transcribe_chunk(i: usize, e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("转写失败 chunk {i}: {e}"),
+        UiLang::En => format!("Transcription failed for chunk {i}: {e}"),
+    }
+}
+
+/// `对齐失败 chunk {i}（{inner}）: {e}`
+/// / `Alignment failed for chunk {i} ({inner}): {e}`。
+pub fn align_chunk(i: usize, inner: &str, e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("对齐失败 chunk {i}（{inner}）: {e}"),
+        UiLang::En => format!("Alignment failed for chunk {i} ({inner}): {e}"),
+    }
+}
+
+/// `{role}模型文件不完整（{missing}）: {dir}`
+/// / `{role} model files are incomplete ({missing}): {dir}`。
+pub fn model_incomplete(role: Str, missing: &str, dir: &str) -> String {
+    let name = t(role);
+    match ui_lang() {
+        UiLang::Zh => format!("{name}模型文件不完整（{missing}）: {dir}"),
+        UiLang::En => format!("{name} model files are incomplete ({missing}): {dir}"),
+    }
+}
+
+/// `[{stage}] I/O 错误: {e}` / `[{stage}] I/O error: {e}`。
+pub fn stage_io_error(stage: &str, e: &std::io::Error) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("[{stage}] I/O 错误: {e}"),
+        UiLang::En => format!("[{stage}] I/O error: {e}"),
+    }
+}
+
+/// `人声分离 GPU 不可用，已改用 CPU（速度明显变慢）：{reason}`
+/// / `Vocal separation: GPU unavailable, falling back to CPU (much slower): {reason}`。
+pub fn sep_gpu_fallback(reason: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("人声分离 GPU 不可用，已改用 CPU（速度明显变慢）：{reason}"),
+        UiLang::En => {
+            format!(
+                "Vocal separation: GPU unavailable, falling back to CPU (much slower): {reason}"
+            )
+        }
+    }
+}
+
+/// `{start}–{end}s 这段解码不完整（复读截断），切成小块也救不回来；该段字幕可能漏字`
+/// / `{start}–{end}s decoded incompletely (repetition cut-off); smaller windows did not
+/// recover it, so this span may be missing lines`。
+///
+/// 只在“撞顶/复读 + 切碎重试也没救回来”时出现——这时宁可告警，也不能静默丢掉几十秒台词。
+pub fn asr_span_incomplete(start: f64, end: f64) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!(
+            "{start:.0}–{end:.0}s 这段解码不完整（复读截断），切成小块也救不回来；该段字幕可能漏字"
+        ),
+        UiLang::En => format!(
+            "{start:.0}–{end:.0}s decoded incompletely (repetition cut-off); smaller windows did not \
+             recover it, so this span may be missing lines"
+        ),
+    }
+}
+
+// ---- 模型目录校验 ----
+
+/// `{role} 模型目录不存在: {dir}` / `{role} model folder not found: {dir}`。
+pub fn model_dir_missing(role: Str, dir: &std::path::Path) -> String {
+    let name = t(role);
+    match ui_lang() {
+        UiLang::Zh => format!("{name} 模型目录不存在: {}", dir.display()),
+        UiLang::En => format!("{name} model folder not found: {}", dir.display()),
+    }
+}
+
+/// `{name}（不存在）` / `{name} (missing)`。
+pub fn file_missing(name: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("{name}（不存在）"),
+        UiLang::En => format!("{name} (missing)"),
+    }
+}
+
+/// `{name}（{actual}/{expected} 字节）` / `{name} ({actual}/{expected} bytes)`。
+pub fn file_size_mismatch(name: &str, actual: u64, expected: u64) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("{name}（{actual}/{expected} 字节）"),
+        UiLang::En => format!("{name} ({actual}/{expected} bytes)"),
+    }
+}
+
+/// `{name} (过小: {len} 字节)` / `{name} (too small: {len} bytes)`。
+pub fn file_too_small(name: &str, len: u64) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("{name} (过小: {len} 字节)"),
+        UiLang::En => format!("{name} (too small: {len} bytes)"),
+    }
+}
+
+/// `{name} (不存在)` / `{name} (not found)`。
+pub fn file_absent(name: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("{name} (不存在)"),
+        UiLang::En => format!("{name} (not found)"),
+    }
+}
+
+/// `{names}… (共 {total} 项)` / `{names}… ({total} in total)`。
+pub fn missing_summary(names: &str, total: usize) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("{names}… (共 {total} 项)"),
+        UiLang::En => format!("{names}… ({total} in total)"),
+    }
+}
+
+/// weight_map 为空的提示（文件名前缀通用，无需翻译文件名本身）。
+pub fn weight_map_empty() -> String {
+    match ui_lang() {
+        UiLang::Zh => "model.safetensors.index.json (weight_map 为空)".into(),
+        UiLang::En => "model.safetensors.index.json (empty weight_map)".into(),
+    }
+}
+
+// ---- 人声分离 / 引擎 ----
+
+/// `人声分离模型不存在: {dir}（请在设置中下载）`
+/// / `Vocal-separation model not found: {dir} (download it in Settings)`。
+pub fn demucs_model_missing(dir: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("人声分离模型不存在: {}（请在设置中下载）", dir.display()),
+        UiLang::En => format!(
+            "Vocal-separation model not found: {} (download it in Settings)",
+            dir.display()
+        ),
+    }
+}
+
+/// `人声分离 GPU 加载失败，改用 CPU: {e}`
+/// / `Vocal separation: GPU load failed, using CPU: {e}`。
+pub fn sep_gpu_load_failed_cpu(e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("人声分离 GPU 加载失败，改用 CPU: {e}"),
+        UiLang::En => format!("Vocal separation: GPU load failed, using CPU: {e}"),
+    }
+}
+
+/// `加载人声分离模型失败（{backend}）: {e}`
+/// / `Failed to load the vocal-separation model ({backend}): {e}`。
+pub fn sep_load_failed(backend: &str, e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("加载人声分离模型失败（{backend}）: {e}"),
+        UiLang::En => format!("Failed to load the vocal-separation model ({backend}): {e}"),
+    }
+}
+
+/// `GPU 加载失败` / `GPU load failed`（FellBackToCpu 的 reason）。
+pub fn sep_gpu_load_failed_reason() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => "GPU 加载失败",
+        UiLang::En => "GPU load failed",
+    }
+}
+
+/// `显卡设备丢失（驱动已重置），已自动改用 CPU 重跑本次任务（速度明显变慢）`
+/// / `The GPU device was lost (the driver was reset); re-running this task on CPU (much slower)`。
+pub fn gpu_device_lost_retry_cpu() -> String {
+    match ui_lang() {
+        UiLang::Zh => "显卡设备丢失（驱动已重置），已自动改用 CPU 重跑本次任务（速度明显变慢）".into(),
+        UiLang::En => {
+            "The GPU device was lost (the driver was reset); re-running this task on CPU (much slower)"
+                .into()
+        }
+    }
+}
+
+/// `ONEASR_DEVICE 无效（{spec}）: {e}` / `Invalid ONEASR_DEVICE ({spec}): {e}`
+/// （设备选择 spec 解析失败——显式指定的卡名/runtime 拼错时直接报错，不静默回退）。
+pub fn device_spec_invalid(spec: &str, e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("ONEASR_DEVICE 无效（{spec}）: {e}"),
+        UiLang::En => format!("Invalid ONEASR_DEVICE ({spec}): {e}"),
+    }
+}
+
+/// `人声分离失败: {e}` / `Vocal separation failed: {e}`。
+pub fn sep_failed(e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("人声分离失败: {e}"),
+        UiLang::En => format!("Vocal separation failed: {e}"),
+    }
+}
+
+/// `人声分离没有返回 vocals 轨道`
+/// / `Vocal separation returned no vocals track`。
+pub fn sep_no_vocals() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => "人声分离没有返回 vocals 轨道",
+        UiLang::En => "Vocal separation returned no vocals track",
+    }
+}
+
+/// `读取分离输入失败 {path}: {e}` / `Failed to read the separation input {path}: {e}`。
+pub fn sep_read_input_failed(path: &std::path::Path, e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("读取分离输入失败 {}: {e}", path.display()),
+        UiLang::En => format!(
+            "Failed to read the separation input {}: {e}",
+            path.display()
+        ),
+    }
+}
+
+/// `读取分离输入失败: {e}` / `Failed to read the separation input: {e}`。
+pub fn sep_read_input_failed_bare(e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("读取分离输入失败: {e}"),
+        UiLang::En => format!("Failed to read the separation input: {e}"),
+    }
+}
+
+/// `分离输入没有声道` / `Separation input has no channels`。
+pub fn sep_no_channels() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => "分离输入没有声道",
+        UiLang::En => "Separation input has no channels",
+    }
+}
+
+/// `写入人声轨道失败 {path}: {e}`
+/// / `Failed to write the vocals track {path}: {e}`。
+pub fn sep_write_failed(path: &std::path::Path, e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("写入人声轨道失败 {}: {e}", path.display()),
+        UiLang::En => format!("Failed to write the vocals track {}: {e}", path.display()),
+    }
+}
+
+/// `写入人声轨道失败: {e}` / `Failed to write the vocals track: {e}`。
+pub fn sep_write_failed_bare(e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("写入人声轨道失败: {e}"),
+        UiLang::En => format!("Failed to write the vocals track: {e}"),
+    }
+}
+
+/// `音频路径非 UTF-8` / `Audio path is not valid UTF-8`。
+pub fn audio_path_not_utf8() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => "音频路径非 UTF-8",
+        UiLang::En => "Audio path is not valid UTF-8",
+    }
+}
+
+/// `对齐器被占用` / `The aligner is busy`。
+pub fn aligner_busy() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => "对齐器被占用",
+        UiLang::En => "The aligner is busy",
+    }
+}
+
+/// `未检测到可用 GPU（需要已安装的显卡驱动）`
+/// / `No usable GPU detected (an installed graphics driver is required)`。
+pub fn no_gpu_detected() -> String {
+    match ui_lang() {
+        UiLang::Zh => "未检测到可用 GPU（需要已安装的显卡驱动）".into(),
+        UiLang::En => "No usable GPU detected (an installed graphics driver is required)".into(),
+    }
+}
+
+/// `{e}。GPU 加速需要已安装的显卡驱动；或在设置中改用 CPU`
+/// / `{e}. GPU acceleration requires an installed graphics driver; or switch to CPU in Settings`。
+pub fn gpu_forced_but_unavailable(e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("{e}。GPU 加速需要已安装的显卡驱动；或在设置中改用 CPU"),
+        UiLang::En => format!(
+            "{e}. GPU acceleration requires an installed graphics driver; or switch to CPU in Settings"
+        ),
+    }
+}
+
+/// `加载语音识别模型失败: {e}{probe_hint}…`（GPU 装载失败的完整指引）。
+pub fn asr_gpu_load_failed(e: &str, probe_hint: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!(
+            "加载语音识别模型失败: {e}{probe_hint}\n\
+             请检查：1) 显卡驱动已安装并更新；2) 关闭占用 GPU 的程序后重试。\
+             或在设置中将后端改为 CPU"
+        ),
+        UiLang::En => format!(
+            "Failed to load the ASR model: {e}{probe_hint}\n\
+             Check: 1) the graphics driver is installed and up to date; 2) close other apps \
+             using the GPU and retry. Or switch the backend to CPU in Settings"
+        ),
+    }
+}
+
+/// `（{gpu}）` / ` ({gpu})`（GPU 装载失败信息里的探测提示括号）。
+pub fn gpu_probe_hint(gpu: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("（{gpu}）"),
+        UiLang::En => format!(" ({gpu})"),
+    }
+}
+
+// ---- 文稿读取（编码） ----
+
+/// `读不了 {path}: {e}` / `Cannot read {path}: {e}`。
+///
+/// IO 错误的底层文本（系统给的）原样带上，只翻译外框。
+pub fn transcript_read_failed(path: &std::path::Path, e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("读不了 {}: {e}", path.display()),
+        UiLang::En => format!("Cannot read {}: {e}", path.display()),
+    }
+}
+
+/// `不是支持的文稿格式: {path}` / `Unsupported transcript format: {path}`。
+pub fn transcript_extension_unsupported(path: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("不是支持的文稿格式: {}", path.display()),
+        UiLang::En => format!("Unsupported transcript format: {}", path.display()),
+    }
+}
+
+/// `看不懂 {} 的编码：既不是 UTF-8，也不是 GBK/GB18030；内容也可能已损坏；请用 UTF-8 另存后重试`
+/// / `Cannot decode {}: it is neither UTF-8 nor GBK/GB18030, or the content is damaged; re-save it as UTF-8 and retry`。
+///
+/// 「另存为 UTF-8」是用户手上唯一有效的动作，所以必须写进文案，而不是只说
+/// 「解码失败」——那等于让用户自己猜下一步。「可能已损坏」半句是为带 BOM 的
+/// UTF-16 / UTF-8 准备的：它编码是判断出来了的，只是内容有半截。
+pub fn transcript_encoding_unknown(path: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!(
+            "看不懂 {} 的编码：既不是 UTF-8，也不是 GBK/GB18030；内容也可能已损坏；请用 UTF-8 另存后重试",
+            path.display()
+        ),
+        UiLang::En => format!(
+            "Cannot decode {}: it is neither UTF-8 nor GBK/GB18030, or the content is damaged; re-save it as UTF-8 and retry",
+            path.display()
+        ),
+    }
+}
+
+/// `{} 是 UTF-32 编码，不支持；请另存为 UTF-8`
+/// / `{} is UTF-32, which is not supported; re-save it as UTF-8`。
+pub fn transcript_utf32_unsupported(path: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("{} 是 UTF-32 编码，不支持；请另存为 UTF-8", path.display()),
+        UiLang::En => format!(
+            "{} is UTF-32, which is not supported; re-save it as UTF-8",
+            path.display()
+        ),
+    }
+}
+
+/// `{} 不像文本文件（里面有 NUL 字节）`
+/// / `{} does not look like a text file (it contains NUL bytes)`。
+pub fn transcript_not_text(path: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("{} 不像文本文件（里面有 NUL 字节）", path.display()),
+        UiLang::En => format!(
+            "{} does not look like a text file (it contains NUL bytes)",
+            path.display()
+        ),
+    }
+}
+
+// ---- 下载进度 ----
+
+/// `{file}: {msg}（已尝试 {n} 次，可再次点击下载续传）`
+/// / `{file}: {msg} (tried {n} times — click download again to resume)`。
+pub fn dl_file_retries_exhausted(file: &str, msg: &str, n: u32) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("{file}: {msg}（已尝试 {n} 次，可再次点击下载续传）"),
+        UiLang::En => format!("{file}: {msg} (tried {n} times — click download again to resume)"),
+    }
+}
+
+/// `{name}（{actual}/{expected} 字节）` / `{name} ({actual}/{expected} bytes)`（下载校验）。
+pub fn dl_size_mismatch(name: &str, actual: u64, expected: u64) -> String {
+    file_size_mismatch(name, actual, expected)
+}
+
+/// `文件缺失或损坏: {list}` / `Missing or corrupted files: {list}`。
+pub fn dl_files_missing(list: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("文件缺失或损坏: {list}"),
+        UiLang::En => format!("Missing or corrupted files: {list}"),
+    }
+}
+
+/// `服务器拒绝断点续传（HTTP 416），已重置`
+/// / `Server rejected resume (HTTP 416) — restarted`。
+pub fn dl_resume_rejected() -> String {
+    match ui_lang() {
+        UiLang::Zh => "服务器拒绝断点续传（HTTP 416），已重置".into(),
+        UiLang::En => "Server rejected resume (HTTP 416) — restarted".into(),
+    }
+}
+
+/// `服务器返回了错误的续传偏移，已重置`
+/// / `Server returned a wrong resume offset — restarted`。
+pub fn dl_resume_offset_invalid() -> String {
+    match ui_lang() {
+        UiLang::Zh => "服务器返回了错误的续传偏移，已重置".into(),
+        UiLang::En => "Server returned a wrong resume offset — restarted".into(),
+    }
+}
+
+/// `文件不完整（{have}/{expected} 字节）` / `File incomplete ({have}/{expected} bytes)`。
+pub fn dl_incomplete(have: u64, expected: u64) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("文件不完整（{have}/{expected} 字节）"),
+        UiLang::En => format!("File incomplete ({have}/{expected} bytes)"),
+    }
+}
+
+/// `SHA-256 校验失败，已删除并重新下载`
+/// / `SHA-256 mismatch — deleted and re-downloading`。
+pub fn dl_sha256_reset() -> String {
+    match ui_lang() {
+        UiLang::Zh => "SHA-256 校验失败，已删除并重新下载".into(),
+        UiLang::En => "SHA-256 mismatch — deleted and re-downloading".into(),
+    }
+}
+
+/// `model.safetensors 或 model.safetensors.index.json`
+/// / `model.safetensors or model.safetensors.index.json`。
+pub fn weight_file_missing() -> String {
+    match ui_lang() {
+        UiLang::Zh => "model.safetensors 或 model.safetensors.index.json".into(),
+        UiLang::En => "model.safetensors or model.safetensors.index.json".into(),
+    }
+}
+
+/// `找不到可写的数据目录（…），设置未保存`
+/// / `Cannot find a writable data directory (…) — settings were not saved`。
+///
+/// `reason` 是 [`crate::paths::DataRootError::message`] 的英文技术原因（哪个
+/// 环境变量缺失），两种语言都原样带上，用户照着补环境变量即可。
+pub fn settings_no_writable_dir(reason: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("找不到可写的数据目录（{reason}），设置未保存"),
+        UiLang::En => {
+            format!("Cannot find a writable data directory ({reason}) — settings were not saved")
+        }
+    }
+}
+
+/// `warning: --no-srt 需要配合 --txt；已保留 SRT 输出`
+/// / `warning: --no-srt requires --txt; SRT output stays enabled`。
+pub fn cli_no_srt_warning() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => "warning: --no-srt 需要配合 --txt；已保留 SRT 输出",
+        UiLang::En => "warning: --no-srt requires --txt; SRT output stays enabled",
+    }
+}
+
+// ─── CLI（oneasr-cli）自产文案的双语表 ──────────────────────────────
+//
+// `oneasr-cli` 随安装包发货，是用户可见入口，所以 **CLI 的每一条输出（用法、
+// 参数校验错误、运行摘要、诊断行）都从这里取词**，bin 里不再出现硬编码文案。
+// 不一致的地方才是真正的例外：`lang=` / `wall=` / `chars=` 这类键值摘要的键名
+// 就是 flag 名，`--- ASR TEXT ---` 是定位标记，两种语言文本一致，但仍集中
+// 定义在这里，保证「所有 CLI 输出只有一个来源」。
+
+/// `--help` 全文；两种语言各一份，成对维护。
+pub fn cli_help() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => CLI_HELP_ZH,
+        UiLang::En => CLI_HELP_EN,
+    }
+}
+
+const CLI_HELP_EN: &str = "\
+oneasr-cli — headless Qwen ASR + ForcedAligner pipeline
+
+Usage:
+  oneasr-cli transcribe --input <media> [options]
+  oneasr-cli asr-chunk  --wav <16k.wav> --start <sec> --end <sec> [options]
+  oneasr-cli render     --timeline <{stem}.timeline.json> [options]
+  oneasr-cli align      --audio <media> --text <transcript> [options]
+  oneasr-cli transcript inspect --input <transcript> [--audio-seconds <n>] [--json]
+  oneasr-cli transcript split   --input <transcript> [--lang <code>] [--preset <id>] [--json]
+  oneasr-cli transcript polish  --input <transcript> [--audio-seconds <n>] [--json]
+  oneasr-cli download   --model <id> [--app-root <dir>] [--data-root <dir>]
+  oneasr-cli status     [--app-root <dir>] [--data-root <dir>] [--json]
+  oneasr-cli probe      --input <media> [--json]
+
+Commands:
+  transcribe   Full pipeline → {data-root}/output/{stem}.srt by default  (alias: run, pipeline)
+  asr-chunk    ASR only for one time range (hallucination / length debug)
+  render       Re-present a measured timeline. No models, no ffmpeg, no audio
+  align        Audio + YOUR transcript → subtitles. Skips recognition entirely;
+               the transcript's own line breaks become the subtitle lines
+               (one line = one cue). Forced to the CTC aligner, which takes the
+               whole file in one pass
+  transcript   Read / summarize / smart-split / beautify a transcript without
+               running the pipeline; used by the GUI before alignment. Your text
+               is the subtitle text: alignment only adds timestamps, so any
+               beautifying is done HERE, on the transcript, and never after it
+  render       Re-present a measured timeline. No models, no ffmpeg, no audio:
+               reads {stem}.timeline.json and writes a subtitle again
+  download     Download one model (ASR / aligner / Demucs / hotword) into its
+               per-model path from settings.json, or {data-root}/models/<name>
+               when no settings exist; already complete files are never
+               downloaded twice
+  status       Machine-readable state of this install: roots, the selected
+               models, readiness (the same check_*_model_dir the pipeline uses),
+               all 8 catalog entries, the media extensions OneAsr accepts, and
+               whether a run can start
+  probe        Size + duration + kind (audio/video/other) of one media file
+
+status options:
+  --app-root <dir>         App root (install dir; default: this exe's install dir)
+  --data-root <dir>        Data dir holding settings.json / models/ (default: --app-root)
+  --json                   Print ONE JSON object on stdout; human-readable lines go
+                           to stderr. Shape (key order is not part of the contract):
+                             version, app_root, data_root, models_root, output_dir,
+                             backend, language, ui_language,
+                             media_exts: [\"wav\", \"mp3\", ...]  (lowercase, no
+                                      dot; the same table probe's kind comes from),
+                             transcript_exts: [\"txt\", \"srt\"]
+                                      (same table transcript reading / pairing uses),
+                             models: {asr, aligner, demucs, sensevoice}
+                                     each {id, dir, ready, error},
+                             catalog: [{id, kind, dir, ready}]  (all 8 entries;
+                                      kind = asr | aligner | demucs | sensevoice),
+                             can_start: {ok, reason}
+                           ready is the one rule the pipeline uses; dir is resolved
+                           exactly like transcribe resolves it; language / ui_language
+                           are the resolved values (never \"system\").
+                           media_exts is core's ONE list of audio/video extensions
+                           (audio first, then video; deduplicated): build file
+                           filters from it instead of keeping a second list.
+                           Exits 0 even when can_start.ok is false: the verdict is
+                           the field, not the exit code
+  --language <code>        This row recognizes as <code>
+  --asr <0.6b|1.7b|dir>    Ask about this ASR model instead of the selected one
+  --aligner <ctc|qwen>     Ask about this aligner instead of the selected one
+  --asr-model-dir <dir>    Ask about this ASR directory for the selected model
+  --aligner-model-dir <dir>
+                           Ask about this aligner directory for the selected model
+  --transcript             This row matches a transcript: require SRT or ASS
+                           and ask about the CTC aligner
+  --vocal-separation       This row runs vocal separation (Demucs becomes required)
+  --hotword-group <id|name>
+                           This row uses that saved hotword group
+  --hotwords <list>        This row uses this inline word list
+  --txt / --ass / --no-srt Same flags with the SAME meaning as transcribe: turn
+                           TXT / ASS on, turn SRT off. Nothing is implied about the
+                           other formats — SRT stays on unless --no-srt says
+                           otherwise. Without any override the verdict is the global
+                           settings.json one; with them it answers \"can THIS row
+                           start?\", which is what a per-row shell gate asks
+
+probe options:
+  --input <path>           Media file (required)
+  --json                   Print ONE JSON object on stdout:
+                             {\"input\":\"...\",\"size_bytes\":412460,
+                              \"duration_sec\":9.35,\"kind\":\"audio\"}
+                           duration_sec is null when probing fails (no ffmpeg,
+                           unreadable container); kind is audio | video | other from
+                           the extension tables in core -- other means the extension
+                           is in neither table (a .txt is never reported as audio),
+                           and the accepted set is status's media_exts. A file
+                           whose metadata cannot be read exits non-zero with a
+                           bilingual reason on stderr.
+                           Without --json: three human-readable lines
+
+transcribe options:
+  --input <path>           Media file (required)
+  --app-root <dir>         App root with bin/ffmpeg  (default: this exe's install dir)
+  --data-root <dir>        Directory holding models/, output/, runs/ and settings.json
+                           (default: --app-root; when the install dir is not writable
+                           the platform user data dir is used instead)
+  --language <code>        zh|en|yue|ja|ko|...  (default: zh)
+  --chunk-seconds <30-180> VAD chunk target (default: 60)
+  --backend <gpu|cpu|auto> Default: auto (GPU if a driver is present, else CPU)
+  --asr <0.6b|1.7b|dir>    Recognition model. A size (0.6b / 1.7b) takes that
+                           size's fp16 or int8 form, fp16 first; an exact
+                           directory name takes only that one. Without the flag,
+                           settings.json's selection wins; with no settings file,
+                           installed dirs are scanned (fp16 before int8)
+  --asr-model-dir <dir>    Override this run's ASR directory (per-model config
+                           from settings.json wins when the flag is absent)
+  --aligner <ctc|qwen>     Forced-aligner engine (settings.json selection when
+                           the flag is absent; no settings -> scan the default
+                           aligner first)
+  --aligner-model-dir <dir>
+                           Override this run's aligner directory
+  --preset <short|standard|loose>
+                           Subtitle length preset (default: standard)
+  --max-new-tokens <n>     ASR decode ceiling (default: settings / 2048)
+  --output <path>          Copy the primary result (SRT, else TXT) to this path
+  --output-dir <dir>       Directory for all enabled outputs (default: {data-root}/output).
+                           With --save-next-to-source this is only the fallback
+  --save-next-to-source    Write outputs next to the source media (GUI default)
+  --txt                    Also write {stem}.txt (one sentence per line; split on
+                           sentence punctuation, never on the subtitle timeline)
+  --ass                    Also write {stem}.ass (karaoke: a sweep per word / CJK char)
+  --no-srt                 Suppress the .srt file (requires --txt or --ass)
+  --no-timeline            Suppress the .timeline.json sidecar. With no timed output
+                           left the aligner is not loaded at all
+                           (--txt --no-srt --no-timeline = transcription only)
+  --script <original|simplified|traditional>
+                           Chinese output script for zh / yue (default: original)
+  --vocal-separation       Run HTDemucs vocal separation before ASR
+  --demucs-model-dir <dir> Directory holding htdemucs_ft_vocals.safetensors
+  --words-json <path>      Write ForcedAligner word/char tokens + timestamps (JSON)
+  --hotword-group <id|name>
+                           Use a saved hotword group from {data-root}/hotword.json;
+                           its terms are recalled per chunk and handed to the ASR
+                           model as a hint (Chinese / English tasks only)
+  --hotwords <list>        Word list given inline (comma / newline separated)
+                           instead of a saved group
+  --sensevoice-model-dir <dir>
+                           Directory holding the SenseVoiceSmall hotword model
+  --events=json            Machine-readable progress on stdout; see the events
+                           section below. Off by default
+
+asr-chunk options:
+  --wav <path>             16 kHz mono wav (required)
+  --start <sec>  --end <sec>
+  --language <code>
+  --app-root <dir>
+  --data-root <dir>
+  --asr <0.6b|1.7b>         Recognition model (same flag, same size/variant rules
+                           as transcribe)
+  --max-new-tokens <n>
+  --out <path>             Write ASR text to file
+  --backend <gpu|cpu|auto>
+
+align options:
+  --audio <path>           Media file (required)
+  --text <path>            Transcript .txt / .srt (required). One line = one
+                           subtitle line; an .srt's own timings are ignored
+  --app-root <dir>         App root with bin/ffmpeg
+  --data-root <dir>        Where models/, output/ and runs/ live
+  --language <code>        zh|en|yue|ja|ko|...  (default: zh)
+  --backend <gpu|cpu|auto> Inference backend (default: auto)
+  --chunk-seconds <30-180> Kept for parity with transcribe; the aligner windows
+                           the audio itself
+  --txt                    Also write {stem}.txt (one sentence per line)
+  --ass                    Also write {stem}.ass (karaoke)
+  --no-srt                 Suppress the .srt file. Transcript matching needs a
+                           timestamped output, so this is only valid with --ass
+  --no-timeline            Suppress the .timeline.json sidecar
+  --script <original|simplified|traditional>
+                           Chinese output script for zh / yue (default: from
+                           settings.json when present, else original)
+  --aligner-model-dir <dir>
+                           Override this run's CTC aligner directory
+  --output-dir <dir>       Directory for all enabled outputs (default: {data-root}/output)
+  --save-next-to-source    Write outputs next to the source media (GUI default);
+                           --output-dir is then only the fallback
+  --vocal-separation       Run HTDemucs vocal separation before alignment
+  --demucs-model-dir <dir> Directory holding htdemucs_ft_vocals.safetensors
+  --beautify               Polish finished cues (punctuation; spaces beside Han
+                           and English or digits, not beside punctuation)
+  --events=json            Machine-readable progress on stdout; see the events
+                           section below. Off by default
+
+transcript options:
+  inspect --input <path> [--audio-seconds <n>] [--json]
+                           Read + normalize + summarize (lines / chars / rate);
+                           --json includes the text
+  split   --input <path> [--lang <code>] [--preset <short|standard|loose>]
+          [--audio-seconds <n>] [--json]
+                           Smart-break long lines. One line = one subtitle line;
+                           the source file is never written
+
+render options:
+  --timeline <path>        Measured timeline written by transcribe (required)
+  --output <dir>           Where to write  (default: the timeline's own directory)
+  --transcript <path>      Re-present with THIS transcript's line breaks instead of
+                           the layout DP's. Reads a .txt / .srt, ignores its timings
+  --preset <id>            Segment length: short|standard|loose
+                           (default: the one the timeline was measured with)
+  --script <original|simplified|traditional>
+                           Chinese output script, as in transcribe
+  --txt                    Also write {stem}.txt (one sentence per line)
+  --ass                    Also write {stem}.ass (karaoke)
+  --no-srt                 Suppress the .srt file (requires --txt or --ass)
+
+download options:
+  --model <id>             Model to download (required). Friendly ids:
+                           0.6b | 1.7b | 0.6b-int8 | 1.7b-int8
+                             ASR; 0.6b / 1.7b take that size's fp16 checkpoint, or
+                             the same size's int8 one when that is already installed
+                           ctc | qwen-align      aligner (CTC / ForcedAligner)
+                           demucs                vocal separation (HTDemucs)
+                           sensevoice            hotword rough pass (SenseVoiceSmall)
+                           Exact install-layout folder names work too, e.g.
+                           Qwen3-ASR-1.7B-int8, omniASR-CTC-300M-v2-hf, htdemucs_ft
+  --app-root <dir>         App root; a model already complete under its models/ counts
+                           as downloaded (default: this exe's install dir)
+  --data-root <dir>        Data directory; new weights land in {data-root}/models/
+                           (default: --app-root)
+  --model-dir <dir>        Download this model into this exact directory (wins
+                           over the per-model path in settings.json)
+
+download progress (all on one line each; wrapped here for width):
+  stderr                   one human-readable line per update (bilingual)
+  stdout                   one machine-readable line per update, keys always in this
+                           order:
+                             [download] state=<downloading|verifying|done|error>
+                             model=<id> done=<bytes> total=<bytes> pct=<0-100>
+                             [speed=<bytes/s>] [dir=\"<path>\"] [message=\"<reason>\"]
+                           pct is omitted while total is unknown (0), speed while the
+                           core reported none, dir on terminal lines only, message on
+                           error lines (newlines folded to spaces, quotes to ').
+                           verifying  probing what is already installed
+                           done       files passed verification; an already complete
+                                      model goes straight from verifying to done
+                           error      exits non-zero, reason on stderr (bilingual)
+
+events (--events=json, transcribe / align):
+  stdout                   one JSON object per line; the human-readable [stage]
+                           lines stay on stderr. Events, in order:
+                             {\"event\":\"stage\",\"key\":\"transcribing\",\"label\":\"Transcribing\",
+                              \"index\":6,\"total\":9,\"pct\":67,\"chunk\":2,\"chunkTotal\":5}
+                               one per stage change, and again when the chunk pair
+                               changes (transcribe, align, vocal separation). chunk
+                               and chunkTotal are the piece in progress (2/5); both
+                               are omitted when the stage has no pieces or only one.
+                               index/total/pct stay the stage plan, not the chunk
+                               count. key is a stable English id:
+                               converting / separating / planning / rough_transcribing /
+                               loading_asr / transcribing / loading_aligner /
+                               aligning / exporting. index counts from 1; total counts
+                               only the stages THIS run will have (no separation -> no
+                               separating; no word list -> no rough_transcribing);
+                               pct = index / total, rounded to an integer
+                             {\"event\":\"timing\",\"key\":\"transcribing\",\"label\":\"Transcribing\",\"ms\":587}
+                               per-stage wall time, emitted at the end of the run
+                             {\"event\":\"total\",\"ms\":12828}
+                             {\"event\":\"done\",\"output\":\"D:\\...\\x.srt\"}   success close-out
+                             {\"event\":\"error\",\"message\":\"...\"}    failure; exits non-zero
+                           Off by default: stdout stays empty and existing callers
+                           see exactly what they saw before
+
+Env:
+  ONEASR_DATA_DIR=<dir>    Override the data directory (same as --data-root)
+  ONEASR_UI_LANG=zh|en     Force UI language for CLI messages (the Electron shell
+                           sets this to the app's UI language)
+  ONEASR_PIPELINE_TRACE=1  Per-chunk ASR/align logs
+
+Examples:
+  oneasr-cli transcribe --input video.mp4 --app-root D:\\OneAsr --chunk-seconds 120 --backend auto
+  oneasr-cli asr-chunk --wav runs\\x\\input_16k.wav --start 722 --end 843 --language zh";
+
+const CLI_HELP_ZH: &str = "\
+oneasr-cli — 免界面的 Qwen ASR + ForcedAligner 流水线
+
+用法：
+  oneasr-cli transcribe --input <音视频> [选项]
+  oneasr-cli asr-chunk  --wav <16k.wav> --start <秒> --end <秒> [选项]
+  oneasr-cli render     --timeline <{stem}.timeline.json> [选项]
+  oneasr-cli align      --audio <音视频> --text <文稿> [选项]
+  oneasr-cli transcript inspect --input <文稿> [--audio-seconds <秒>] [--json]
+  oneasr-cli transcript split   --input <文稿> [--lang <代码>] [--preset <id>] [--json]
+  oneasr-cli transcript polish  --input <文稿> [--audio-seconds <秒>] [--json]
+  oneasr-cli download   --model <id> [--app-root <目录>] [--data-root <目录>]
+  oneasr-cli status     [--app-root <目录>] [--data-root <目录>] [--json]
+  oneasr-cli probe      --input <音视频> [--json]
+
+子命令：
+  transcribe   完整流水线，默认输出到 {data-root}/output/{stem}.srt（别名：run、pipeline）
+  asr-chunk    只对一段时间做转写（排查幻觉 / 长度问题）
+  render       重新呈现已测好的时间轴。不加载模型、不用 ffmpeg、不碰音频
+  align        音视频 + 你自己的文稿 → 字幕，整个识别阶段跳过。文稿自己的分行
+               就是字幕的分行（一行 = 一条），文稿那一行就是字幕那一行（逐字，
+               含空格）。固定用 CTC 对齐器，它能整段一次对齐，长音频不必切块：
+               对齐之后不再有任何改字步骤
+  transcript   读 / 摘要 / 智能断句 / 美化一份文稿，不跑流水线；GUI 在打轴之前
+               用它。美化只在这里做（改的是文稿本身），不会在后面再跑一遍：
+               文稿模式的文字就是文稿，机器只加时间戳
+  download     下载一个模型（识别 / 对齐 / 人声分离 / 热词）到 settings.json
+               里该模型自己的目录；没有配置时落到 {data-root}/models/<目录名>。
+               已装好且校验通过的不重下
+  status       这份安装 + 这份设置的机器可读快照：根目录、选中的模型、就绪
+               （与管线同一套 check_*_model_dir）、8 条可选模型、支持的音视频
+               扩展名、能不能开跑
+  probe        一个媒体文件的尺寸 + 时长 + 类型（音频/视频/其他）
+
+status 选项：
+  --app-root <目录>        应用目录（与其它子命令同一个意思；默认取本程序安装目录）
+  --data-root <目录>       数据目录（放 settings.json 与 models/；默认取 --app-root）
+  --json                   stdout 只输出一个 JSON 对象；人读行一律走 stderr。形状
+                           （键名是契约，顺序不保证）：
+                             version、app_root、data_root、models_root、output_dir、
+                             backend、language、ui_language、
+                             media_exts: [\"wav\", \"mp3\", ...]（全小写、不带点；
+                                      与 probe 的 kind 是同一张表），
+                             transcript_exts: [\"txt\", \"srt\"]
+                                      （文稿读取 / 配对用的同一张表），
+                             models: {asr, aligner, demucs, sensevoice}
+                                     各是 {id, dir, ready, error}，
+                             catalog: [{id, kind, dir, ready}]（8 条全列；
+                                      kind = asr | aligner | demucs | sensevoice），
+                             can_start: {ok, reason}
+                           ready 用管线那唯一一条判据；dir 与 transcribe 解析出来的
+                           完全一致；language / ui_language 都是解析后的值（不会是
+                           system）。can_start.ok = false 时退出码仍是 0 —— 结论在
+                           字段里，不在退出码里。media_exts 是 core 里唯一一份
+                           音视频扩展名表（音频在前、视频在后，已去重）：壳拿它
+                           拼文件过滤器，别再养第二份
+  --language <代码>        这一行按 <代码> 识别
+  --asr <0.6b|1.7b|目录名> 问这个识别模型，而不是设置里选中的那个
+  --aligner <ctc|qwen>     问这个对齐器，而不是设置里选中的那个
+  --asr-model-dir <目录>   按这个目录问当前选中的识别模型
+  --aligner-model-dir <目录>
+                           按这个目录问当前选中的对齐模型
+  --transcript             这一行挂文稿：要求 SRT 或 ASS，并按 CTC 对齐器问门禁
+  --vocal-separation       这一行做人声分离（于是要求 Demucs 就位）
+  --hotword-group <id|组名>
+                           这一行用这个热词组
+  --hotwords <词表>        这一行用这份即席词表
+  --txt / --ass / --no-srt 与 transcribe `同义` 的同名旗标：打开 TXT / ASS、关掉
+                           SRT，其余格式不受影响（不给 --no-srt，SRT 就还开着）。
+                           一个开关都不给 → 全局 settings.json 的结论；给了 → 回答
+                           「这一行能不能起」，逐行门禁问的正是这个
+
+probe 选项：
+  --input <路径>           音视频文件（必填）
+  --json                   stdout 只输出一个 JSON 对象：
+                             {\"input\":\"...\",\"size_bytes\":412460,
+                              \"duration_sec\":9.35,\"kind\":\"audio\"}
+                           duration_sec 探不到时是 null（缺 ffmpeg、容器读不了）；
+                           kind 是 audio | video | other，表在 core：两张表都不在
+                           就是 other（.txt 不会再被说成音频），认得的集合就是
+                           status 的 media_exts。读不到文件元数据时非 0 退出，
+                           原因双语写 stderr。不带 --json：人读三行
+
+transcribe 选项：
+  --input <路径>           音视频文件（必填）
+  --app-root <目录>        应用目录（含 bin/ffmpeg；默认取本程序安装目录）
+  --data-root <目录>       数据目录（放 models/、output/、runs/ 与 settings.json；
+                           默认取 --app-root；安装目录不可写时自动改用平台用户目录）
+  --language <代码>        zh|en|yue|ja|ko|...（默认 zh）
+  --chunk-seconds <30-180> VAD 分段目标时长（默认 60）
+  --backend <gpu|cpu|auto> 推理后端，默认 auto（有显卡驱动走 GPU，否则 CPU）
+  --asr <0.6b|1.7b|目录名> 识别模型。给尺寸（0.6b / 1.7b）就用该尺寸的 fp16 或 int8 变体，
+                           fp16 优先；给完整目录名则只认它自己。不给这个旗标时，
+                           以 settings.json 的选择为准；完全没有配置文件才按安装
+                           布局扫描已装目录
+  --asr-model-dir <目录>   这一趟改用这个识别目录（不给时用 settings.json 里
+                           该模型自己的目录）
+  --aligner <ctc|qwen>     对齐引擎（不给时用 settings.json 的选择；没有配置才扫描，
+                           默认引擎优先）
+  --aligner-model-dir <目录>
+                           这一趟改用这个对齐目录
+  --preset <short|standard|loose>
+                           字幕长度预设（默认 standard）
+  --max-new-tokens <n>     转写解码上限（默认取设置 / 2048）
+  --output <路径>          把主产物（SRT，没有则 TXT）复制到该路径
+  --output-dir <目录>      所有启用格式的输出目录（默认 {data-root}/output）；
+                           配合 --save-next-to-source 时只作兜底
+  --save-next-to-source    输出写到源文件旁（GUI 默认）
+  --txt                    额外写出 {stem}.txt（一行一句；按句末标点断句，
+                           不看字幕时间轴）
+  --ass                    额外写出 {stem}.ass（卡拉OK：逐词 / 中日韩逐字扫光）
+  --no-srt                 不写 .srt 文件（需配合 --txt 或 --ass）
+  --no-timeline            不写 .timeline.json 边车文件。只有没有任何定时产物时
+                           对齐器才不加载（--txt --no-srt --no-timeline = 纯转录）
+  --script <original|simplified|traditional>
+                           zh / yue 的中文字形（默认 original）
+  --vocal-separation       转写前先做人声分离
+  --demucs-model-dir <目录> 存放 htdemucs_ft_vocals.safetensors 的目录
+  --words-json <路径>      写出 ForcedAligner 的词/字级时间轴（JSON）
+  --hotword-group <id|组名>
+                           使用 {data-root}/hotword.json 里保存的热词组；热词逐段
+                           召回后作为提示词交给识别模型（仅对中文与英文任务生效）
+  --hotwords <词表>        直接给热词表（逗号 / 换行分隔），不经过热词组
+  --sensevoice-model-dir <目录>
+                           存放 SenseVoiceSmall 热词模型的目录
+  --events=json            机器可读进度走 stdout，格式见下面「事件流」一节；
+                           默认关闭
+
+asr-chunk 选项：
+  --wav <路径>             16 kHz 单声道 wav（必填）
+  --start <秒>  --end <秒>
+  --language <代码>
+  --app-root <目录>
+  --data-root <目录>
+  --asr <0.6b|1.7b>         识别模型（与 transcribe 同一个旗标，同一套尺寸/变体规则）
+  --max-new-tokens <n>
+  --out <路径>             把转写文本写入文件
+  --backend <gpu|cpu|auto>
+
+align 选项：
+  --audio <路径>           音视频文件（必填）
+  --text <路径>            文稿 .txt / .srt（必填）。一行 = 一条字幕行；
+                           .srt 自带的时间轴会被忽略
+  --app-root <目录>        应用目录（含 bin/ffmpeg）
+  --data-root <目录>       数据目录（放 models/、output/、runs/）
+  --language <代码>        zh|en|yue|ja|ko|...（默认 zh）
+  --backend <gpu|cpu|auto> 推理后端，默认 auto
+  --chunk-seconds <30-180> 与 transcribe 保持一致；对齐器自己会开窗
+  --txt                    额外写出 {stem}.txt（一行一句）
+  --ass                    额外写出 {stem}.ass（卡拉OK）
+  --no-srt                 不写 .srt 文件。文稿匹配需要带时间轴的产物，
+                           所以它只能与 --ass 同用
+  --no-timeline            不写 .timeline.json 边车文件
+  --script <original|simplified|traditional>
+                           zh / yue 的中文字形（有 settings.json 时默认沿用，否则 original）
+  --aligner-model-dir <目录>
+                           这一趟改用这个 CTC 对齐目录
+  --output-dir <目录>      所有启用格式的输出目录（默认 {data-root}/output）
+  --save-next-to-source    输出写到源文件旁（GUI 默认）；--output-dir 此时只作兜底
+  --vocal-separation       对齐前先做人声分离
+  --demucs-model-dir <目录> 存放 htdemucs_ft_vocals.safetensors 的目录
+  --beautify               成稿字幕美化（标点；汉字与英文、数字之间加空格，标点旁边不加）
+  --events=json            机器可读进度走 stdout，格式见下面「事件流」一节；默认关闭
+
+transcript 选项：
+  inspect --input <路径> [--audio-seconds <秒>] [--json]
+                           读取 + 规范化 + 摘要（行数 / 字数 / 语速）；--json 带正文
+  split   --input <路径> [--lang <代码>] [--preset <short|standard|loose>]
+          [--audio-seconds <秒>] [--json]
+                           智能断句：只拆过长行，绝不写回原文件
+
+render 选项：
+  --timeline <路径>        transcribe 写出的已测时间轴（必填）
+  --output <目录>          输出目录（默认与时间轴同目录）
+  --transcript <路径>      改用这份文稿自己的分行，而不是排版 DP 的结果。
+                           读 .txt / .srt，忽略它原有的时间轴
+  --preset <id>            分段时长：short|standard|loose
+                           （默认沿用测量时的那个）
+  --script <original|simplified|traditional>
+                           中文字形，同 transcribe
+  --txt                    额外写出 {stem}.txt（一行一句）
+  --no-srt                 不写 .srt 文件（需配合 --txt）
+
+download 选项：
+  --model <id>             要下载的模型（必填）。友好写法：
+                           0.6b | 1.7b | 0.6b-int8 | 1.7b-int8
+                             识别模型；0.6b / 1.7b 下该尺寸的 fp16 权重，该尺寸的
+                             int8 已经装好时也认它已装（不再下一份）
+                           ctc | qwen-align      对齐器（CTC / ForcedAligner）
+                           demucs                人声分离（HTDemucs）
+                           sensevoice            热词粗转（SenseVoiceSmall）
+                           完整目录名同样可用，如 Qwen3-ASR-1.7B-int8、
+                           omniASR-CTC-300M-v2-hf、htdemucs_ft
+  --app-root <目录>        应用目录；它 models/ 下已装好且校验通过的模型算「已下好」
+                           （默认取本程序安装目录）
+  --data-root <目录>       数据目录；新权重落在 {data-root}/models/ 下
+                           （默认取 --app-root）
+  --model-dir <目录>       把这个模型下载到这个确切目录（优先于 settings.json
+                           里该模型自己的路径）
+
+download 进度（每行都是一整行，这里为排版折行）：
+  stderr                   每次更新一行人读文本（双语）
+  stdout                   每次更新一行机器可读文本，键名与顺序固定：
+                             [download] state=<downloading|verifying|done|error>
+                             model=<id> done=<bytes> total=<bytes> pct=<0-100>
+                             [speed=<bytes/s>] [dir=\"<路径>\"] [message=\"<原因>\"]
+                           total 未知（0）时不带 pct，速度未知时不带 speed，
+                           dir 只在终态出现，message 只在 error 行出现（换行折成
+                           空格、引号换成单引号）。
+                           verifying  正在检查已装文件
+                           done       校验通过；已经装好的模型会从 verifying 直接到 done
+                           error      退出码非 0，原因在 stderr（双语）
+
+事件流（--events=json，transcribe / align）：
+  stdout                   每行一个 JSON 对象；人读的 [阶段] 行仍走 stderr。事件按顺序：
+                             {\"event\":\"stage\",\"key\":\"transcribing\",\"label\":\"转写\",
+                              \"index\":6,\"total\":9,\"pct\":67,\"chunk\":2,\"chunkTotal\":5}
+                               阶段变化时一条；同一阶段里分段变了再发一条（转写、打轴、
+                               人声分离）。chunk / chunkTotal 是正在处理的第几段（2/5）；
+                               这一阶段没有分段、或只有一段时不带这两个字段。
+                               index / total / pct 仍是阶段计划，不是分段计数。
+                               key 是稳定的英文标识：converting /
+                               separating / planning / rough_transcribing /
+                               loading_asr / transcribing / loading_aligner /
+                               aligning / exporting。index 从 1 数；total 只算这一趟
+                               真会出现的阶段（没人声分离就不含 separating，没热词组
+                               就不含 rough_transcribing）；pct = index / total 四舍五入
+                             {\"event\":\"timing\",\"key\":\"transcribing\",\"label\":\"转写\",\"ms\":587}
+                               每个阶段的耗时，收尾时发出
+                             {\"event\":\"total\",\"ms\":12828}
+                             {\"event\":\"done\",\"output\":\"D:\\...\\x.srt\"}   成功收尾
+                             {\"event\":\"error\",\"message\":\"...\"}    失败收尾，退出码非 0
+                           默认关闭：stdout 保持空，现有调用方看到的行为逐字不变
+
+环境变量：
+  ONEASR_DATA_DIR=<目录>   覆盖数据目录（等价于 --data-root）
+  ONEASR_UI_LANG=zh|en     强制 CLI 文案语言（Electron 壳会设成界面的 UI 语言）
+  ONEASR_PIPELINE_TRACE=1  打印每个分段的转写/对齐细节
+
+示例：
+  oneasr-cli transcribe --input video.mp4 --app-root D:\\OneAsr --chunk-seconds 120 --backend auto
+  oneasr-cli asr-chunk --wav runs\\x\\input_16k.wav --start 722 --end 843 --language zh
+  oneasr-cli render --timeline output\\clip.timeline.json --preset short --output output";
+
+/// `=== OneAsr CLI · 重渲染 ===` / `=== OneAsr CLI · render ===`。
+pub fn cli_render_banner() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => "=== OneAsr CLI · 重渲染 ===",
+        UiLang::En => "=== OneAsr CLI · render ===",
+    }
+}
+
+/// 见 [`CLI_KV_INPUT`]。
+pub const CLI_KV_TIMELINE: Str = Str::new("时间轴:  ", "timeline: ");
+/// 见 [`CLI_KV_INPUT`]。
+pub const CLI_KV_TRANSCRIPT: Str = Str::new("文稿:    ", "transcript:");
+
+/// `=== OneAsr CLI · 文稿匹配 ===` / `=== OneAsr CLI · align ===`。
+pub fn cli_align_banner() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => "=== OneAsr CLI · 文稿匹配 ===",
+        UiLang::En => "=== OneAsr CLI · align ===",
+    }
+}
+
+/// `— {lines} 行 · {chars} 字{ignored}`，括号里那句只在 SRT 出现：原时间轴被丢了。
+pub fn cli_transcript_loaded(lines: usize, chars: usize, ignored: bool) -> String {
+    let dropped = match (ui_lang(), ignored) {
+        (UiLang::Zh, true) => "（已忽略原时间轴，将重新打轴）",
+        (UiLang::En, true) => " (original timings ignored; re-aligning)",
+        _ => "",
+    };
+    match ui_lang() {
+        UiLang::Zh => format!("— {lines} 行 · {chars} 字{dropped}"),
+        UiLang::En => format!("— {lines} lines · {chars} chars{dropped}"),
+    }
+}
+
+/// `重渲染失败: {e}` / `render failed: {e}`。
+pub fn cli_render_failed(e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("重渲染失败: {e}"),
+        UiLang::En => format!("render failed: {e}"),
+    }
+}
+
+/// `.{ext} 是空的，没有写出` / `.{ext} came out empty; nothing written`。
+pub fn cli_render_empty(ext: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!(".{ext} 是空的，没有写出"),
+        UiLang::En => format!(".{ext} came out empty; nothing written"),
+    }
+}
+
+/// `读不了时间轴: {e}` / `cannot read timeline: {e}`。
+pub fn cli_timeline_read_failed(e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("读不了时间轴: {e}"),
+        UiLang::En => format!("cannot read timeline: {e}"),
+    }
+}
+
+/// `未知的分段时长：{raw}（可选 short | standard | loose）`
+/// / `Unknown segment length: {raw} (choose short | standard | loose)`。
+pub fn cli_preset_unknown(raw: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("未知的分段时长：{raw}（可选 short | standard | loose）"),
+        UiLang::En => format!("Unknown segment length: {raw} (choose short | standard | loose)"),
+    }
+}
+
+/// `未知的中文字形：{raw}（可选 original | simplified | traditional）`
+/// / `Unknown Chinese script: {raw} (choose original | simplified | traditional)`。
+pub fn cli_script_unknown(raw: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => {
+            format!("未知的中文字形：{raw}（可选 original | simplified | traditional）")
+        }
+        UiLang::En => {
+            format!("Unknown Chinese script: {raw} (choose original | simplified | traditional)")
+        }
+    }
+}
+
+/// `文稿按 {name} 读取（不是 UTF-8；字不对就另存为 UTF-8）`
+/// / `transcript read as {name} (not UTF-8; re-save it as UTF-8 if the text looks wrong)`。
+///
+/// GB18030 / UTF-16 是**换过码**的：靠 BOM 猜、或靠 GB18030 兑下来，都有猜
+/// 错的可能（Shift_JIS 就是典型）。说一句比不说好——用户至少知道字是从哪来的。
+pub fn cli_transcript_encoding(name: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("文稿按 {name} 读取（不是 UTF-8；字不对就另存为 UTF-8）"),
+        UiLang::En => format!(
+            "transcript read as {name} (not UTF-8; re-save it as UTF-8 if the text looks wrong)"
+        ),
+    }
+}
+
+/// `align 需要带时间轴的产物：SRT 或 ASS 至少启用一个（--no-srt 只能与 --ass 同用）`
+/// / `align needs a timestamped output: enable SRT or ASS (--no-srt is only valid with --ass)`。
+///
+/// 用法错（退出码 2），不是「模型没就绪」：文稿匹配的产物必须带时间轴，
+/// 判据在 [`crate::settings::timed_output_selected`]。
+pub fn cli_align_needs_timed_output() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => {
+            "align 需要带时间轴的产物：SRT 或 ASS 至少启用一个（--no-srt 只能与 --ass 同用）"
+        }
+        UiLang::En => {
+            "align needs a timestamped output: enable SRT or ASS (--no-srt is only valid with --ass)"
+        }
+    }
+}
+
+/// `未知的对齐引擎：{raw}（可选 ctc | qwen，或完整目录名）`
+/// / `Unknown aligner engine: {raw} (choose ctc | qwen, or an exact directory name)`。
+/// 文稿匹配只吃 CTC 对齐器目录。
+///
+/// 把 Qwen3-ForcedAligner 那种目录传给 `--aligner-model-dir` 时，CTC 引擎会去解析
+/// 它的 config，报 `missing field conv_dim`，再被包成「加载语音识别模型失败」——
+/// 三个词全都指向错误的方向（模型没坏、配置没坏、也不是识别模型）。
+pub fn cli_align_needs_ctc_dir(dir: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!(
+            "文稿匹配固定用 CTC 对齐器：{} 不是 CTC 模型目录（缺 vocab.json）。请去掉 --aligner-model-dir，或指向 omniASR-CTC-300M 那类目录。",
+            dir.display()
+        ),
+        UiLang::En => format!(
+            "align always uses the CTC aligner: {} is not a CTC model directory (no vocab.json). Drop --aligner-model-dir, or point it at an omniASR-CTC-300M style directory.",
+            dir.display()
+        ),
+    }
+}
+
+pub fn cli_aligner_unknown(raw: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("未知的对齐引擎：{raw}（可选 ctc | qwen，或完整目录名）"),
+        UiLang::En => {
+            format!("Unknown aligner engine: {raw} (choose ctc | qwen, or an exact directory name)")
+        }
+    }
+}
+
+/// `未知的识别模型：{raw}（可选 0.6b | 1.7b，或完整目录名）`
+/// / `Unknown ASR model: {raw} (choose 0.6b | 1.7b, or an exact directory name)`。
+pub fn cli_asr_unknown(raw: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("未知的识别模型：{raw}（可选 0.6b | 1.7b，或完整目录名）"),
+        UiLang::En => {
+            format!("Unknown ASR model: {raw} (choose 0.6b | 1.7b, or an exact directory name)")
+        }
+    }
+}
+
+/// `--hotwords` 即席词表在 `HotwordRun.group_name` 里的名字（banner 不回显
+/// 组名，见 [`cli_hotword_run`]；这个只服务「空词表」那条报错文案）。
+pub const CLI_HOTWORD_INLINE: Str = Str::new("命令行", "inline");
+
+/// `align` 整个跳过识别阶段（文字来自文稿），热词旗标对它没有作用。
+pub const CLI_ALIGN_HOTWORDS_IGNORED: Str = Str::new(
+    "align 不跑识别阶段，热词对它没有作用（已忽略）",
+    "align skips recognition, so hotwords have no effect here (ignored)",
+);
+
+/// 文稿模式的字幕文字就是文稿本身，打轴之后不再改字，所以 `align --beautify`
+/// 没有作用。美化要提前到文稿上做（`transcript polish` / GUI 面板的「美化字幕」）。
+pub const CLI_ALIGN_BEAUTIFY_IGNORED: Str = Str::new(
+    "align 不改文稿的字（字幕就是你的原文），--beautify 已忽略；要美化请先对文稿跑 transcript polish",
+    "align never rewrites your transcript (the subtitle IS your text), so --beautify is ignored; run `transcript polish` on the transcript instead",
+);
+
+/// `--hotword-group` 找不到组：把**可用组全列出来**（id + 显示名），
+/// 用户照着改就行。
+///
+/// `options` 是 [`crate::hotword::HotwordStore::menu_options`] 的形状
+/// `(id, 显示名)`。分隔符与括号两种语言各一套。
+pub fn cli_hotword_group_unknown(query: &str, options: &[(String, String)]) -> String {
+    let zh = matches!(ui_lang(), UiLang::Zh);
+    let list = options
+        .iter()
+        .map(|(id, name)| {
+            if zh {
+                format!("{id}（{name}）")
+            } else {
+                format!("{id} ({name})")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(if zh { "、" } else { ", " });
+    if zh {
+        format!("找不到热词组「{query}」；可用组（id 或组名都行）：{list}")
+    } else {
+        format!("no hotword group matches \"{query}\"; available (id or name): {list}")
+    }
+}
+
+/// `热词组「{query}」有重名，用 id 指名：{ids}`
+/// / `hotword group "{query}" is ambiguous — use an id: {ids}`。
+pub fn cli_hotword_group_ambiguous(query: &str, ids: &[&str]) -> String {
+    let zh = matches!(ui_lang(), UiLang::Zh);
+    let list = ids.join(if zh { "、" } else { ", " });
+    if zh {
+        format!("热词组「{query}」有重名，用 id 指名：{list}")
+    } else {
+        format!("hotword group \"{query}\" is ambiguous — use an id: {list}")
+    }
+}
+
+/// `--hotword-group 与 --hotwords 只能给一个` /
+/// `pass only one of --hotword-group and --hotwords`。
+pub fn cli_hotwords_both_flags() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => "--hotword-group 与 --hotwords 只能给一个",
+        UiLang::En => "pass only one of --hotword-group and --hotwords",
+    }
+}
+
+/// `--hotwords 解析后没有词条（按逗号或换行分隔）` /
+/// `--hotwords contains no words after parsing (comma or newline separated)`。
+pub fn cli_hotwords_empty() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => "--hotwords 解析后没有词条（按逗号或换行分隔）",
+        UiLang::En => "--hotwords contains no words after parsing (comma or newline separated)",
+    }
+}
+
+/// 运行摘要里的热词行：`热词:    64 条` / `hotwords: 64 words`。
+///
+/// **只报条数，不回显组名**：banner 是常规输出（会进日志、会被贴出去），
+/// 组名是用户内容（「客户A」「某某项目」都可能），不该在这里复读；用户自己
+/// 命令行上写了哪个组，自己知道。需要指名道姓的是**错误路径**——找不到组、
+/// 重名、空组——那些地方用户必须知道说的是谁。
+pub fn cli_hotword_run(words: usize) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("热词:    {words} 条"),
+        UiLang::En => format!("hotwords: {words} words"),
+    }
+}
+
+/// 热词库读取异常（迁移 / 自愈 / 坏文件的原因摘要），配合 [`cli_warn`]。
+pub fn cli_hotword_store_issue(summary: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("热词库读取异常：{summary}"),
+        UiLang::En => format!("hotword store issue: {summary}"),
+    }
+}
+
+/// 语言不支持时的跳过提示（配合 [`cli_warn`]）：选了组也不会生效，必须说出来。
+pub fn cli_hotwords_language_skipped(language: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("热词已跳过：「{language}」不使用热词（只接中文与英文）"),
+        UiLang::En => {
+            format!(
+                "hotwords skipped: \"{language}\" does not use hotwords (Chinese and English only)"
+            )
+        }
+    }
+}
+
+/// `未知命令: {other}` / `unknown command: {other}`。
+pub fn cli_unknown_command(other: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("未知命令: {other}"),
+        UiLang::En => format!("unknown command: {other}"),
+    }
+}
+
+/// `缺少必需参数 {name}` / `missing required {name}`。
+pub fn cli_missing_required(name: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("缺少必需参数 {name}"),
+        UiLang::En => format!("missing required {name}"),
+    }
+}
+
+/// `{flag} 必须是数字（秒）` / `{flag} must be a number (seconds)`。
+pub fn cli_flag_not_number(flag: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("{flag} 必须是数字（秒）"),
+        UiLang::En => format!("{flag} must be a number (seconds)"),
+    }
+}
+
+/// `--end 必须大于 --start` / `--end must be > --start`。
+pub fn cli_end_before_start() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => "--end 必须大于 --start",
+        UiLang::En => "--end must be > --start",
+    }
+}
+
+/// `找不到输入文件: {path}` / `input not found: {path}`。
+pub fn cli_input_not_found(path: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("找不到输入文件: {}", path.display()),
+        UiLang::En => format!("input not found: {}", path.display()),
+    }
+}
+
+/// `找不到 wav 文件: {path}` / `wav not found: {path}`。
+pub fn cli_wav_not_found(path: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("找不到 wav 文件: {}", path.display()),
+        UiLang::En => format!("wav not found: {}", path.display()),
+    }
+}
+
+/// `--app-root 不是目录: {path}` / `--app-root not a directory: {path}`。
+pub fn cli_app_root_not_dir(path: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("--app-root 不是目录: {}", path.display()),
+        UiLang::En => format!("--app-root not a directory: {}", path.display()),
+    }
+}
+
+/// `--data-root 已存在但不是目录: {path}`
+/// / `--data-root exists but is not a directory: {path}`。
+///
+/// 不存在的目录是合法的（第一次运行会在那里建 `models/`），只有"存在但不是
+/// 目录"才是参数错误。
+pub fn cli_data_root_not_dir(path: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("--data-root 已存在但不是目录: {}", path.display()),
+        UiLang::En => format!(
+            "--data-root exists but is not a directory: {}",
+            path.display()
+        ),
+    }
+}
+
+/// `=== OneAsr CLI · 下载模型 ===` / `=== OneAsr CLI · download ===`。
+pub fn cli_download_banner() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => "=== OneAsr CLI · 下载模型 ===",
+        UiLang::En => "=== OneAsr CLI · download ===",
+    }
+}
+
+/// 摘要行里的模型 id（值是目录名，不是路径）。见 [`CLI_KV_INPUT`]。
+pub const CLI_KV_MODEL: Str = Str::new("模型:    ", "model:   ");
+/// 摘要行里新权重的落点目录。见 [`CLI_KV_INPUT`]。
+pub const CLI_KV_TARGET: Str = Str::new("落点:    ", "target:  ");
+
+/// `未知的模型：{raw}（可选 …，或完整目录名）`
+/// / `Unknown model: {raw} (choose …, or an exact directory name)`。
+///
+/// 列出的就是 `download --model` 认的全部友好写法；其余名字一律拒绝，**不猜默认
+/// 值**——`--asr` 猜错只是跑错型号，下载猜错是下错几个 GB。
+pub fn cli_download_unknown(raw: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!(
+            "未知的模型：{raw}（可选 0.6b | 0.6b-int8 | 1.7b | 1.7b-int8 | ctc | qwen-align | demucs | sensevoice，或完整目录名）"
+        ),
+        UiLang::En => format!(
+            "Unknown model: {raw} (choose 0.6b | 0.6b-int8 | 1.7b | 1.7b-int8 | ctc | qwen-align | demucs | sensevoice, or an exact directory name)"
+        ),
+    }
+}
+
+/// `检查已装模型: {model}` / `checking the installed model: {model}`。
+pub fn cli_download_verifying(model: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("检查已装模型: {model}"),
+        UiLang::En => format!("checking the installed model: {model}"),
+    }
+}
+
+/// `已存在且校验通过: {model} → {dir}（不重新下载）`
+/// / `already complete and verified: {model} → {dir} (not downloading again)`。
+pub fn cli_download_already(model: &str, dir: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!(
+            "已存在且校验通过: {model} → {}（不重新下载）",
+            dir.display()
+        ),
+        UiLang::En => format!(
+            "already complete and verified: {model} → {} (not downloading again)",
+            dir.display()
+        ),
+    }
+}
+
+/// 人读的进度行：`[下载] 名称 50% 1.00 GB / 2.00 GB（8.0 MB/s）`
+/// / `[download] name 50% 1.00 GB / 2.00 GB (8.0 MB/s)`。
+///
+/// 总量或速度未知（0）时对应片段整段不出现——不编造一个 0。
+pub fn cli_download_progress(model: &str, done: u64, total: u64, speed: u64) -> String {
+    let mut body = model.to_string();
+    if let Some(pct) = percent_of(done, total) {
+        body.push_str(&format!(" {pct:.0}%"));
+    }
+    body.push_str(&format!(" {}", human_bytes(done)));
+    if total > 0 {
+        body.push_str(&format!(" / {}", human_bytes(total)));
+    }
+    if speed > 0 {
+        let (open, close) = match ui_lang() {
+            UiLang::Zh => ("（", "）"),
+            UiLang::En => (" (", ")"),
+        };
+        body.push_str(&format!("{open}{}/s{close}", human_bytes(speed)));
+    }
+    match ui_lang() {
+        UiLang::Zh => format!("[下载] {body}"),
+        UiLang::En => format!("[download] {body}"),
+    }
+}
+
+/// `下载完成: {model} → {dir}` / `download complete: {model} → {dir}`。
+pub fn cli_download_done(model: &str, dir: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("下载完成: {model} → {}", dir.display()),
+        UiLang::En => format!("download complete: {model} → {}", dir.display()),
+    }
+}
+
+/// `下载失败: {model}：{e}` / `download failed: {model}: {e}`。
+pub fn cli_download_failed(model: &str, e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("下载失败: {model}：{e}"),
+        UiLang::En => format!("download failed: {model}: {e}"),
+    }
+}
+
+/// `模型目录不可写: {dir}（{e}）`
+/// / `model directory is not writable: {dir} ({e})`。
+pub fn cli_download_dir_not_writable(dir: &std::path::Path, e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("模型目录不可写: {}（{e}）", dir.display()),
+        UiLang::En => format!("model directory is not writable: {} ({e})", dir.display()),
+    }
+}
+
+/// `下载已取消: {model}` / `download cancelled: {model}`。
+pub fn cli_download_cancelled(model: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("下载已取消: {model}"),
+        UiLang::En => format!("download cancelled: {model}"),
+    }
+}
+
+/// 机器可读的进度行（`download` 的 stdout 契约，格式见 [`cli_help`]）：
+/// `[download] state=… model=… done=… total=… [pct=…] [speed=…] [dir="…"]`。
+///
+/// **键名与顺序是契约**：两种语言逐字相同，新增字段一律往后加。
+/// - `pct` 只在总量已知（total > 0）时出现，算法与
+///   [`DownloadProgress::percent`](crate::model::DownloadProgress::percent) 同一口径；
+/// - `speed` 只在 core 的进度回调给了非零速度时出现（单位 B/s）；
+/// - `dir` 只在终态（done / error）出现，加引号是因为路径里可能有空格。
+pub fn cli_download_event(
+    state: &str,
+    model: &str,
+    done: u64,
+    total: u64,
+    speed: u64,
+    dir: Option<&std::path::Path>,
+    message: Option<&str>,
+) -> String {
+    let mut line = format!("[download] state={state} model={model} done={done} total={total}");
+    if let Some(pct) = percent_of(done, total) {
+        line.push_str(&format!(" pct={pct:.0}"));
+    }
+    if speed > 0 {
+        line.push_str(&format!(" speed={speed}"));
+    }
+    if let Some(dir) = dir {
+        line.push_str(&format!(" dir=\"{}\"", dir.display()));
+    }
+    if let Some(message) = message {
+        // 机器行必须始终是一行：换行、引号会把上层解析搞坏。错误原文里的
+        // 换行折成空格，引号换成单引号，长度上限 300 字符。
+        let one_line: String = message
+            .replace(['\r', '\n'], " ")
+            .replace('"', "'")
+            .chars()
+            .take(300)
+            .collect();
+        line.push_str(&format!(" message=\"{one_line}\""));
+    }
+    line
+}
+
+/// 进度百分比：0-100 夹紧，总量未知（0）时不报——与
+/// [`DownloadProgress::percent`](crate::model::DownloadProgress::percent) 同一条算法
+/// （那边服务界面，这边服务命令行，规则只有这一条）。
+fn percent_of(done: u64, total: u64) -> Option<f32> {
+    (total > 0).then(|| ((done as f64 / total as f64) * 100.0).clamp(0.0, 100.0) as f32)
+}
+
+/// 人类可读的字节数：`1.00 GB` / `345.6 MB` / `12 KB` / `987 B`。
+///
+/// 单位（GB/MB/KB）是国际写法，两种语言相同；小数位与界面上的速度显示同一口径。
+fn human_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let x = n as f64;
+    if x >= GB {
+        format!("{:.2} GB", x / GB)
+    } else if x >= MB {
+        format!("{:.1} MB", x / MB)
+    } else if x >= KB {
+        format!("{:.0} KB", x / KB)
+    } else {
+        format!("{n} B")
+    }
+}
+
+// ─── CLI：status / probe（机器可读优先，人读走 stderr） ──────────────
+//
+// 这两个子命令是给上层壳用的：它只解析 stdout 上的 JSON，人读摘要一律走 stderr
+// （与 download 同一约定）。所以下面的文案只服务「没有 --json 时」那一眼。
+
+/// `=== OneAsr CLI · 状态 ===` / `=== OneAsr CLI · status ===`。
+pub fn cli_status_banner() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => "=== OneAsr CLI · 状态 ===",
+        UiLang::En => "=== OneAsr CLI · status ===",
+    }
+}
+
+/// 见 [`CLI_KV_INPUT`]：版本号（跟 Cargo.toml 的 workspace 版本走）。
+pub const CLI_KV_VERSION: Str = Str::new("版本:    ", "version: ");
+/// 见 [`CLI_KV_INPUT`]：模型根目录（`{data-root}/models`）。
+pub const CLI_KV_MODELS_ROOT: Str = Str::new("模型库:  ", "models:  ");
+/// 见 [`CLI_KV_INPUT`]：推理后端。
+pub const CLI_KV_BACKEND: Str = Str::new("后端:    ", "backend: ");
+/// 见 [`CLI_KV_INPUT`]：识别语言。
+pub const CLI_KV_LANGUAGE: Str = Str::new("语言:    ", "language:");
+/// 见 [`CLI_KV_INPUT`]：界面语言（已解析成 zh / en，不会是 system）。
+pub const CLI_KV_UI_LANGUAGE: Str = Str::new("界面语言:", "ui:      ");
+/// 见 [`CLI_KV_INPUT`]：支持的音视频扩展名（`status --json` 的 `media_exts`）。
+pub const CLI_KV_MEDIA_EXTS: Str = Str::new("媒体扩展:", "media:   ");
+/// 见 [`CLI_KV_INPUT`]：开跑门禁的结论。
+pub const CLI_KV_CAN_START: Str = Str::new("开跑:    ", "can_start:");
+
+/// `[模型]` / `[models]` —— status 人读输出的模型小节标题。
+pub fn cli_status_models_header() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => "[模型]",
+        UiLang::En => "[models]",
+    }
+}
+
+/// `[可选模型]` / `[catalog]`。
+pub fn cli_status_catalog_header() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => "[可选模型]",
+        UiLang::En => "[catalog]",
+    }
+}
+
+/// 就绪 / 未就绪标签（模型行与 catalog 行共用一份）。
+fn ready_tag(ready: bool) -> &'static str {
+    match (ready, ui_lang()) {
+        (true, UiLang::Zh) => "就绪  ",
+        (true, UiLang::En) => "ready ",
+        (false, UiLang::Zh) => "未就绪",
+        (false, UiLang::En) => "not ready",
+    }
+}
+
+/// 一行模型槽位：`asr       就绪  Qwen3-ASR-0.6B-hf  D:\…`。
+///
+/// 未就绪时打印**原因**而不是目录 —— 那才是要修的东西；目录在 JSON 里，
+/// 上层要看随时能拿（人读这一眼只回答「缺什么」）。
+pub fn cli_model_row(
+    role: &str,
+    id: &str,
+    dir: &std::path::Path,
+    ready: bool,
+    error: Option<&str>,
+) -> String {
+    match (ready, error) {
+        (false, Some(e)) => format!("{role:<10} {} {id}  {e}", ready_tag(false)),
+        _ => format!("{role:<10} {} {id}  {}", ready_tag(ready), dir.display()),
+    }
+}
+
+/// catalog 的一行：`asr       就绪  Qwen3-ASR-0.6B-hf`。
+pub fn cli_catalog_row(kind: &str, id: &str, ready: bool) -> String {
+    format!("{kind:<10} {} {id}", ready_tag(ready))
+}
+
+/// 门禁结论：`可以开跑` / `开不了跑：{reason}`。
+pub fn cli_can_start_line(ok: bool, reason: Option<&str>) -> String {
+    match (ui_lang(), ok, reason) {
+        (UiLang::Zh, true, _) => "可以开跑".to_string(),
+        (UiLang::Zh, false, Some(r)) => format!("开不了跑：{r}"),
+        (UiLang::Zh, false, None) => "开不了跑".to_string(),
+        (UiLang::En, true, _) => "ready to start".to_string(),
+        (UiLang::En, false, Some(r)) => format!("cannot start: {r}"),
+        (UiLang::En, false, None) => "cannot start".to_string(),
+    }
+}
+
+/// 见 [`CLI_KV_INPUT`]：文件大小。
+pub const CLI_KV_SIZE: Str = Str::new("大小:    ", "size:    ");
+/// 见 [`CLI_KV_INPUT`]：媒体时长。
+pub const CLI_KV_DURATION: Str = Str::new("时长:    ", "duration:");
+/// 见 [`CLI_KV_INPUT`]：媒体类型（音频 / 视频）。
+pub const CLI_KV_KIND: Str = Str::new("类型:    ", "kind:    ");
+
+/// 时长：`9.35 s`；探测不到时是「未知」/ `unknown`（不是 0）——「探不到」
+/// 与「真的是 0 秒」必须能分开。
+pub fn cli_probe_duration(secs: Option<f64>) -> String {
+    match (secs, ui_lang()) {
+        (Some(s), _) => format!("{s:.2} s"),
+        (None, UiLang::Zh) => "未知".to_string(),
+        (None, UiLang::En) => "unknown".to_string(),
+    }
+}
+
+/// 读不到文件信息（不存在 / 无权限）：非 0 退出，原因双语。
+pub fn cli_probe_failed(path: &std::path::Path, e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("读不到文件信息: {}（{e}）", path.display()),
+        UiLang::En => format!("cannot read file metadata: {} ({e})", path.display()),
+    }
+}
+
+/// `--events=<x>` 只认 `json`；别的值报用法错误，不猜默认。
+pub fn cli_events_unknown(raw: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("--events 只支持 json，收到: {raw}"),
+        UiLang::En => format!("--events only supports json, got: {raw}"),
+    }
+}
+
+/// `=== OneAsr CLI · 转写 ===` / `=== OneAsr CLI · transcribe ===`。
+pub fn cli_transcribe_banner() -> &'static str {
+    match ui_lang() {
+        UiLang::Zh => "=== OneAsr CLI · 转写 ===",
+        UiLang::En => "=== OneAsr CLI · transcribe ===",
+    }
+}
+
+/// 运行摘要的字段名（与 CLI flag 对应，两种语言各自排版）。
+pub const CLI_KV_INPUT: Str = Str::new("输入:    ", "input:   ");
+/// 见 [`CLI_KV_INPUT`]。
+pub const CLI_KV_APP: Str = Str::new("应用:    ", "app:     ");
+/// 见 [`CLI_KV_INPUT`]。
+pub const CLI_KV_DATA: Str = Str::new("数据:    ", "data:    ");
+/// 见 [`CLI_KV_INPUT`]。
+pub const CLI_KV_ASR: Str = Str::new("ASR 模型:", "asr:     ");
+/// 见 [`CLI_KV_INPUT`]。
+pub const CLI_KV_ALIGN: Str = Str::new("对齐模型:", "align:   ");
+/// 见 [`CLI_KV_INPUT`]。
+pub const CLI_KV_OUTPUT: Str = Str::new("输出:    ", "output:  ");
+
+/// 运行摘要的一行：`{label}{path}`（label 取 [`CLI_KV_INPUT`] 等）。
+pub fn cli_kv(label: Str, path: &std::path::Path) -> String {
+    cli_kv_str(label, &path.display().to_string())
+}
+
+/// 同 [`cli_kv`]，但值是任意字符串：模型 id 这类目录名不是路径，
+/// 别为了复用它硬塞一个 `Path`。
+pub fn cli_kv_str(label: Str, value: &str) -> String {
+    format!("{}{}", t(label), value)
+}
+
+/// `lang={lang} chunk={chunk}s backend={backend} max_new_tokens={n}`（键名即 flag 名）。
+pub fn cli_run_flags_decode(
+    lang: &str,
+    chunk: u32,
+    backend: &str,
+    max_new_tokens: usize,
+) -> String {
+    format!("lang={lang} chunk={chunk}s backend={backend} max_new_tokens={max_new_tokens}")
+}
+
+/// `srt={srt} txt={txt} script={script} vocal_sep={vocal_sep}`（键名即 flag 名）。
+pub fn cli_run_flags_output(srt: bool, txt: bool, script: &str, vocal_sep: bool) -> String {
+    format!("srt={srt} txt={txt} script={script} vocal_sep={vocal_sep}")
+}
+
+/// `[阶段] {label}` / `[stage] {label}`。
+pub fn cli_stage(label: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("[阶段] {label}"),
+        UiLang::En => format!("[stage] {label}"),
+    }
+}
+
+/// `[警告] {msg}` / `[warn] {msg}`。
+pub fn cli_warn(msg: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("[警告] {msg}"),
+        UiLang::En => format!("[warn] {msg}"),
+    }
+}
+
+/// `完成 output={path}` / `OK output={path}`。
+pub fn cli_ok_output(path: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("完成 output={}", path.display()),
+        UiLang::En => format!("OK output={}", path.display()),
+    }
+}
+
+/// `复制输出失败: {e}` / `copy output failed: {e}`。
+pub fn cli_copy_failed(e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("复制输出失败: {e}"),
+        UiLang::En => format!("copy output failed: {e}"),
+    }
+}
+
+/// `已复制 → {path}` / `copied → {path}`。
+pub fn cli_copied(path: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("已复制 → {}", path.display()),
+        UiLang::En => format!("copied → {}", path.display()),
+    }
+}
+
+/// `词级时间轴 → {path}` / `words → {path}`。
+pub fn cli_words_written(path: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("词级时间轴 → {}", path.display()),
+        UiLang::En => format!("words → {}", path.display()),
+    }
+}
+
+/// `wall={wall:.1}s total_ms={total_ms} stages={stages}`（机器可读摘要）。
+pub fn cli_timing(wall_secs: f64, total_ms: u64, stages: usize) -> String {
+    format!("wall={wall_secs:.1}s total_ms={total_ms} stages={stages}")
+}
+
+/// 阶段耗时行：`  {label:<12} {dur:>8}`（列宽对齐，两种语言一致）。
+pub fn cli_stage_row(label: &str, dur: &str) -> String {
+    format!("  {label:<12} {dur:>8}")
+}
+
+/// `失败（耗时 {wall:.1}s）: {e}` / `FAIL after {wall:.1}s: {e}`。
+pub fn cli_failed(wall_secs: f64, e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("失败（耗时 {wall_secs:.1}s）: {e}"),
+        UiLang::En => format!("FAIL after {wall_secs:.1}s: {e}"),
+    }
+}
+
+/// `切片 {start:.3}-{end:.3}（{len:.1}s）→ {path}` / `slice … ({len:.1}s) → {path}`。
+pub fn cli_slice_done(start: f32, end: f32, len_secs: f32, path: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!(
+            "切片 {start:.3}-{end:.3}（{len_secs:.1}s）→ {}",
+            path.display()
+        ),
+        UiLang::En => format!(
+            "slice {start:.3}-{end:.3} ({len_secs:.1}s) → {}",
+            path.display()
+        ),
+    }
+}
+
+/// `切片失败: {e}` / `slice_wav: {e}`。
+pub fn cli_slice_failed(e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("切片失败: {e}"),
+        UiLang::En => format!("slice_wav: {e}"),
+    }
+}
+
+/// `转写失败: {e}` / `transcription failed: {e}`。
+pub fn cli_transcribe_failed(e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("转写失败: {e}"),
+        UiLang::En => format!("transcription failed: {e}"),
+    }
+}
+
+/// `chars={chars} raw_chars={raw} elapsed={secs:.1}s`（机器可读摘要）。
+pub fn cli_chars(chars: usize, raw_chars: usize, elapsed_secs: f64) -> String {
+    format!("chars={chars} raw_chars={raw_chars} elapsed={elapsed_secs:.1}s")
+}
+
+/// `--- 识别文本开始 ---` / `--- ASR TEXT BEGIN ---`（定位标记）。
+pub const CLI_ASR_TEXT_BEGIN: Str = Str::new("--- 识别文本开始 ---", "--- ASR TEXT BEGIN ---");
+/// 见 [`CLI_ASR_TEXT_BEGIN`]。
+pub const CLI_ASR_TEXT_END: Str = Str::new("--- 识别文本结束 ---", "--- ASR TEXT END ---");
+
+/// `写入失败: {e}` / `write: {e}`。
+pub fn cli_write_failed(e: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("写入失败: {e}"),
+        UiLang::En => format!("write: {e}"),
+    }
+}
+
+/// `已写入 {path}` / `wrote {path}`。
+pub fn cli_wrote(path: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("已写入 {}", path.display()),
+        UiLang::En => format!("wrote {}", path.display()),
+    }
+}
+
+/// `ffmpeg: {bin} 下没有 ffmpeg，改用 {source}`
+/// / `ffmpeg: no binary under {bin} — using {source}`。
+pub fn cli_ffmpeg_fallback(bin: &std::path::Path, source: &str) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!("ffmpeg: {} 下没有 ffmpeg，改用 {source}", bin.display()),
+        UiLang::En => format!("ffmpeg: no binary under {} — using {source}", bin.display()),
+    }
+}
+
+/// `找不到 ffmpeg：把二进制放进 {bin}，或把 ffmpeg 加进 PATH`
+/// / `ffmpeg not found: put a binary in {bin} or install ffmpeg on PATH`。
+pub fn cli_ffmpeg_not_found(bin: &std::path::Path) -> String {
+    match ui_lang() {
+        UiLang::Zh => format!(
+            "找不到 ffmpeg：把二进制放进 {}，或把 ffmpeg 加进 PATH",
+            bin.display()
+        ),
+        UiLang::En => format!(
+            "ffmpeg not found: put a binary in {} or install ffmpeg on PATH",
+            bin.display()
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn system_lang_code() -> Option<String> {
+    // kernel32 的 GetUserDefaultUILanguage：不引新依赖，主语言 ID 直接映射。
+    unsafe extern "system" {
+        fn GetUserDefaultUILanguage() -> u16;
+    }
+    // SAFETY: 无参数、无前置条件，只读系统 UI 语言设置；不返回指针、不转移所有权、
+    // 不会失败（未知时返回 0，下面的掩码映射已把它归到 en）。调用可重复、无副作用。
+    let langid = unsafe { GetUserDefaultUILanguage() };
+    Some(match langid & 0x3ff {
+        0x0004 => "zh".to_string(),
+        _ => "en".to_string(),
+    })
+}
+
+#[cfg(not(windows))]
+fn system_lang_code() -> Option<String> {
+    std::env::var("LC_ALL")
+        .or_else(|_| std::env::var("LC_MESSAGES"))
+        .or_else(|_| std::env::var("LANG"))
+        .ok()
+}
+
+#[cfg(test)]
+pub fn with_ui_lang<R>(lang: UiLang, f: impl FnOnce() -> R) -> R {
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = ui_lang();
+    set_ui_lang(lang);
+    let out = f();
+    set_ui_lang(prev);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_code_maps_zh_and_rest_to_en() {
+        assert_eq!(UiLang::from_code("zh"), UiLang::Zh);
+        assert_eq!(UiLang::from_code("zh-CN"), UiLang::Zh);
+        assert_eq!(UiLang::from_code("zh_TW"), UiLang::Zh);
+        assert_eq!(UiLang::from_code("en-US"), UiLang::En);
+        assert_eq!(UiLang::from_code("ja"), UiLang::En);
+        assert_eq!(UiLang::from_code("C"), UiLang::En);
+        assert_eq!(UiLang::from_code(""), UiLang::En);
+    }
+
+    #[test]
+    fn setting_value_round_trips() {
+        assert_eq!(UiLang::Zh.setting_value(), "zh");
+        assert_eq!(UiLang::En.setting_value(), "en");
+    }
+
+    #[test]
+    fn normalize_ui_language_whitelists() {
+        assert_eq!(normalize_ui_language("system"), "system");
+        assert_eq!(normalize_ui_language("zh"), "zh");
+        assert_eq!(normalize_ui_language(" ZH "), "zh");
+        assert_eq!(normalize_ui_language("zh-CN"), "zh");
+        assert_eq!(normalize_ui_language("zh-Hans"), "zh");
+        assert_eq!(normalize_ui_language("en"), "en");
+        assert_eq!(normalize_ui_language("fr"), "system");
+        assert_eq!(normalize_ui_language(""), "system");
+        assert_eq!(normalize_ui_language("garbage"), "system");
+    }
+
+    #[test]
+    fn t_returns_pair_by_lang() {
+        let s = Str::new("设置", "Settings");
+        with_ui_lang(UiLang::Zh, || assert_eq!(t(s), "设置"));
+        with_ui_lang(UiLang::En, || assert_eq!(t(s), "Settings"));
+    }
+
+    #[test]
+    fn str_get_reads_the_explicit_language_without_the_global() {
+        // 不经过进程级语言：两种语言在同一个测试里都能断言，
+        // 这正是显式取词存在的理由（GUI 的纯函数靠它写单测）。
+        let s = Str::new("设置", "Settings");
+        assert_eq!(s.get(UiLang::Zh), "设置");
+        assert_eq!(s.get(UiLang::En), "Settings");
+    }
+
+    #[test]
+    fn cli_help_is_bilingual() {
+        let zh = with_ui_lang(UiLang::Zh, cli_help);
+        let en = with_ui_lang(UiLang::En, cli_help);
+        assert!(zh.contains("用法："), "zh help must be Chinese: {zh}");
+        assert!(
+            zh.contains("转写"),
+            "zh help must use the glossary term 转写"
+        );
+        assert!(
+            en.contains("Usage:"),
+            "en help keeps the upstream wording: {en}"
+        );
+        assert!(en.contains("transcribe"));
+        assert_ne!(zh, en);
+    }
+
+    #[test]
+    fn cli_help_states_the_txt_and_no_timeline_contract() {
+        // 整篇 `contains` 会被 transcribe / align 的同款文案满足，看不出 render
+        // 那行有没有改；先切出 render 小节（标题到下一个空行），断言只锚在
+        // 这一节里。
+        fn section<'a>(help: &'a str, header: &str) -> &'a str {
+            let start = help
+                .find(header)
+                .unwrap_or_else(|| panic!("help has no {header} section"));
+            let rest = &help[start..];
+            let end = rest.find("\n\n").unwrap_or(rest.len());
+            &rest[..end]
+        }
+
+        let zh = with_ui_lang(UiLang::Zh, cli_help);
+        let en = with_ui_lang(UiLang::En, cli_help);
+        // render 的 `--txt` 与 transcribe / align 同一个口径：一行一句。
+        let zh_render = section(zh, "render 选项：");
+        assert!(
+            zh_render.contains("--txt") && zh_render.contains("额外写出 {stem}.txt（一行一句）"),
+            "render options must say one sentence per line: {zh_render}"
+        );
+        let en_render = section(en, "render options:");
+        assert!(
+            en_render.contains("--txt")
+                && en_render.contains("Also write {stem}.txt (one sentence per line)"),
+            "render options must say one sentence per line: {en_render}"
+        );
+        // `--no-timeline` 不能说满：只有没有任何定时产物时才不加载对齐器。
+        assert!(
+            zh.contains("只有没有任何定时产物时"),
+            "zh help must scope the aligner skip: {zh}"
+        );
+        assert!(
+            en.contains("With no timed output"),
+            "en help must scope the aligner skip: {en}"
+        );
+        assert!(
+            !en.contains("Nothing consumes the"),
+            "the old overstated wording must be gone: {en}"
+        );
+    }
+
+    #[test]
+    fn cli_messages_follow_the_ui_language() {
+        let path = std::path::Path::new("C:/tmp/video.mp4");
+        with_ui_lang(UiLang::Zh, || {
+            assert_eq!(cli_unknown_command("foo"), "未知命令: foo");
+            assert_eq!(cli_flag_not_number("--start"), "--start 必须是数字（秒）");
+            assert_eq!(cli_missing_required("--input"), "缺少必需参数 --input");
+            assert_eq!(
+                cli_input_not_found(path),
+                "找不到输入文件: C:/tmp/video.mp4"
+            );
+            assert_eq!(cli_stage("转写"), "[阶段] 转写");
+            assert_eq!(cli_kv(CLI_KV_INPUT, path), "输入:    C:/tmp/video.mp4");
+            assert_eq!(t(CLI_ASR_TEXT_BEGIN), "--- 识别文本开始 ---");
+        });
+        with_ui_lang(UiLang::En, || {
+            assert_eq!(cli_unknown_command("foo"), "unknown command: foo");
+            assert_eq!(
+                cli_flag_not_number("--start"),
+                "--start must be a number (seconds)"
+            );
+            assert_eq!(cli_missing_required("--input"), "missing required --input");
+            assert_eq!(
+                cli_input_not_found(path),
+                "input not found: C:/tmp/video.mp4"
+            );
+            assert_eq!(cli_stage("Transcribing"), "[stage] Transcribing");
+            assert_eq!(cli_kv(CLI_KV_INPUT, path), "input:   C:/tmp/video.mp4");
+            assert_eq!(t(CLI_ASR_TEXT_END), "--- ASR TEXT END ---");
+        });
+    }
+
+    /// `--help` 两种语言都要把热词旗标列全：stderr 的用法是用户发现它们的唯一入口。
+    #[test]
+    fn cli_help_documents_the_hotword_flags() {
+        let zh = with_ui_lang(UiLang::Zh, cli_help);
+        let en = with_ui_lang(UiLang::En, cli_help);
+        for flag in ["--hotword-group", "--hotwords", "--sensevoice-model-dir"] {
+            assert!(zh.contains(flag), "zh help 少了 {flag}: {zh}");
+            assert!(en.contains(flag), "en help 少了 {flag}: {en}");
+        }
+        assert!(
+            zh.contains("仅对中文与英文"),
+            "zh help 要写明热词的语言范围: {zh}"
+        );
+        assert!(
+            en.contains("Chinese / English"),
+            "en help 要写明热词的语言范围: {en}"
+        );
+    }
+
+    /// 热词相关的 CLI 消息跟随界面语言（含 `--hotword-group` 的两种报错形态）。
+    #[test]
+    fn cli_hotword_messages_follow_the_ui_language() {
+        let options = vec![
+            ("default".to_string(), "默认".to_string()),
+            ("terms".to_string(), "术语表".to_string()),
+        ];
+        with_ui_lang(UiLang::Zh, || {
+            assert_eq!(
+                cli_hotword_group_unknown("nope", &options),
+                "找不到热词组「nope」；可用组（id 或组名都行）：default（默认）、terms（术语表）"
+            );
+            assert_eq!(
+                cli_hotword_group_ambiguous("甲", &["g1", "g2"]),
+                "热词组「甲」有重名，用 id 指名：g1、g2"
+            );
+            assert_eq!(
+                cli_hotwords_both_flags(),
+                "--hotword-group 与 --hotwords 只能给一个"
+            );
+            assert_eq!(
+                cli_hotwords_empty(),
+                "--hotwords 解析后没有词条（按逗号或换行分隔）"
+            );
+            assert_eq!(cli_hotword_run(64), "热词:    64 条");
+            assert_eq!(
+                cli_hotword_store_issue("parse error: bad json"),
+                "热词库读取异常：parse error: bad json"
+            );
+            assert_eq!(
+                cli_hotwords_language_skipped("ja"),
+                "热词已跳过：「ja」不使用热词（只接中文与英文）"
+            );
+        });
+        with_ui_lang(UiLang::En, || {
+            assert_eq!(
+                cli_hotword_group_unknown("nope", &options),
+                "no hotword group matches \"nope\"; available (id or name): default (默认), terms (术语表)"
+            );
+            assert_eq!(
+                cli_hotword_group_ambiguous("甲", &["g1", "g2"]),
+                "hotword group \"甲\" is ambiguous — use an id: g1, g2"
+            );
+            assert_eq!(
+                cli_hotwords_both_flags(),
+                "pass only one of --hotword-group and --hotwords"
+            );
+            assert_eq!(
+                cli_hotwords_empty(),
+                "--hotwords contains no words after parsing (comma or newline separated)"
+            );
+            assert_eq!(cli_hotword_run(64), "hotwords: 64 words");
+            assert_eq!(
+                cli_hotword_store_issue("parse error: bad json"),
+                "hotword store issue: parse error: bad json"
+            );
+            assert_eq!(
+                cli_hotwords_language_skipped("ja"),
+                "hotwords skipped: \"ja\" does not use hotwords (Chinese and English only)"
+            );
+        });
+    }
+
+    /// `--help` 必须写清 download 的取值与机器可读契约（stderr 给人、stdout 给上层）：
+    /// 用户与上层没有别的入口知道这套写法。
+    #[test]
+    fn cli_help_documents_the_download_command_and_its_progress_contract() {
+        let zh = with_ui_lang(UiLang::Zh, cli_help);
+        let en = with_ui_lang(UiLang::En, cli_help);
+        for (lang, help) in [("zh", zh), ("en", en)] {
+            assert!(
+                help.contains("download"),
+                "{lang} help 少了 download 子命令"
+            );
+            assert!(help.contains("--model"), "{lang} help 少了 --model");
+            // 机器行是契约：状态取值、键名与顺序两种语言都写死。
+            assert!(
+                help.contains("state=<downloading|verifying|done|error>"),
+                "{lang} help 没写状态取值: {help}"
+            );
+            assert!(
+                help.contains("model=<id> done=<bytes> total=<bytes> pct=<0-100>"),
+                "{lang} help 没写机器行格式"
+            );
+            // 全部友好写法都要列出来。
+            for id in [
+                "0.6b",
+                "0.6b-int8",
+                "1.7b",
+                "1.7b-int8",
+                "ctc",
+                "qwen-align",
+                "demucs",
+                "sensevoice",
+            ] {
+                assert!(help.contains(id), "{lang} help 少了 id {id}");
+            }
+        }
+    }
+
+    /// download 的人读行跟随界面语言；进度行的括号也按语言换形（语序差异兜在
+    /// helper 里，调用方不拼句子）。
+    #[test]
+    fn cli_download_messages_follow_the_ui_language() {
+        let dir = std::path::Path::new("models").join("Qwen3-ASR-0.6B-hf");
+        with_ui_lang(UiLang::Zh, || {
+            assert_eq!(t(CLI_KV_MODEL), "模型:    ");
+            assert_eq!(t(CLI_KV_TARGET), "落点:    ");
+            assert_eq!(
+                cli_download_unknown("nope"),
+                "未知的模型：nope（可选 0.6b | 0.6b-int8 | 1.7b | 1.7b-int8 | ctc | qwen-align | demucs | sensevoice，或完整目录名）"
+            );
+            assert_eq!(
+                cli_download_progress("Qwen3-ASR-0.6B-hf", 1_073_741_824, 2_147_483_648, 8_388_608),
+                "[下载] Qwen3-ASR-0.6B-hf 50% 1.00 GB / 2.00 GB（8.0 MB/s）"
+            );
+            // 总量与速度未知时整段不出现——不编造一个 0。
+            assert_eq!(
+                cli_download_progress("htdemucs_ft", 5, 0, 0),
+                "[下载] htdemucs_ft 5 B"
+            );
+            assert_eq!(
+                cli_download_already("Qwen3-ASR-0.6B-hf", &dir),
+                format!(
+                    "已存在且校验通过: Qwen3-ASR-0.6B-hf → {}（不重新下载）",
+                    dir.display()
+                )
+            );
+        });
+        with_ui_lang(UiLang::En, || {
+            assert_eq!(t(CLI_KV_MODEL), "model:   ");
+            assert_eq!(
+                cli_download_progress("Qwen3-ASR-0.6B-hf", 1_073_741_824, 2_147_483_648, 8_388_608),
+                "[download] Qwen3-ASR-0.6B-hf 50% 1.00 GB / 2.00 GB (8.0 MB/s)"
+            );
+            assert_eq!(
+                cli_download_failed("htdemucs_ft", "os error 5"),
+                "download failed: htdemucs_ft: os error 5"
+            );
+        });
+    }
+
+    /// `download` 的机器可读行：键名与顺序是上层（Electron 壳）解析的依据，
+    /// 两种语言必须逐字相同。
+    ///
+    /// 断骨验证：把 `cli_download_event` 的字段顺序调换、或按语言给中文键名，
+    /// 本用例立刻变红。
+    #[test]
+    fn cli_download_event_stays_language_neutral() {
+        let dir = std::path::Path::new("some dir");
+        for lang in [UiLang::Zh, UiLang::En] {
+            with_ui_lang(lang, || {
+                assert_eq!(
+                    cli_download_event(
+                        "downloading",
+                        "Qwen3-ASR-0.6B-hf",
+                        1_073_741_824,
+                        2_147_483_648,
+                        8_388_608,
+                        None,
+                        None
+                    ),
+                    "[download] state=downloading model=Qwen3-ASR-0.6B-hf done=1073741824 total=2147483648 pct=50 speed=8388608"
+                );
+                // total 未知：pct 整段缺省（不是 pct=0）。
+                assert_eq!(
+                    cli_download_event("verifying", "htdemucs_ft", 0, 0, 0, None, None),
+                    "[download] state=verifying model=htdemucs_ft done=0 total=0"
+                );
+                // 终态带 dir；路径可能含空格，所以加引号。
+                assert_eq!(
+                    cli_download_event(
+                        "done",
+                        "htdemucs_ft",
+                        84_025_440,
+                        84_025_440,
+                        0,
+                        Some(dir),
+                        None
+                    ),
+                    format!(
+                        "[download] state=done model=htdemucs_ft done=84025440 total=84025440 pct=100 dir=\"{}\"",
+                        dir.display()
+                    )
+                );
+                // 失败：状态叫 error（不是 failed），速度缺省；error 行带 message。
+                assert_eq!(
+                    cli_download_event(
+                        "error",
+                        "htdemucs_ft",
+                        100,
+                        200,
+                        0,
+                        None,
+                        Some("connection reset\nretry")
+                    ),
+                    "[download] state=error model=htdemucs_ft done=100 total=200 pct=50 message=\"connection reset retry\""
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn cli_machine_readable_lines_stay_language_neutral() {
+        // 键名就是 flag 名，两种语言必须逐字相同：贴日志的人和脚本都按它检索。
+        for lang in [UiLang::Zh, UiLang::En] {
+            with_ui_lang(lang, || {
+                assert_eq!(
+                    cli_run_flags_decode("zh", 60, "auto", 2048),
+                    "lang=zh chunk=60s backend=auto max_new_tokens=2048"
+                );
+                assert_eq!(
+                    cli_run_flags_output(true, false, "原文", false),
+                    "srt=true txt=false script=原文 vocal_sep=false"
+                );
+                assert_eq!(
+                    cli_timing(12.3, 12_300, 3),
+                    "wall=12.3s total_ms=12300 stages=3"
+                );
+                assert_eq!(cli_chars(5, 7, 2.0), "chars=5 raw_chars=7 elapsed=2.0s");
+                let row = cli_stage_row("asr", "12.3s");
+                assert!(row.starts_with("  asr"), "{row}");
+                assert!(row.ends_with("12.3s"), "{row}");
+                assert_eq!(row.chars().count(), 2 + 12 + 1 + 8, "{row}");
+            });
+        }
+    }
+
+    /// status / probe 的人读文案：两种语言都成对存在，且键值行与现有 cli_kv 同款。
+    #[test]
+    fn cli_status_and_probe_helpers_follow_the_ui_language() {
+        let path = std::path::Path::new("C:/tmp/x");
+        with_ui_lang(UiLang::Zh, || {
+            assert_eq!(cli_status_banner(), "=== OneAsr CLI · 状态 ===");
+            assert_eq!(cli_kv(CLI_KV_VERSION, path), "版本:    C:/tmp/x");
+            assert_eq!(cli_can_start_line(true, None), "可以开跑");
+            assert_eq!(
+                cli_can_start_line(false, Some("缺模型")),
+                "开不了跑：缺模型"
+            );
+            let not_ready = cli_model_row("asr", "m", path, false, Some("缺文件"));
+            assert!(
+                not_ready.starts_with("asr")
+                    && not_ready.contains("未就绪")
+                    && not_ready.ends_with("缺文件"),
+                "{not_ready}"
+            );
+            let ready = cli_model_row("asr", "m", path, true, None);
+            assert!(
+                ready.contains("就绪") && ready.contains("C:/tmp/x"),
+                "{ready}"
+            );
+            assert!(cli_catalog_row("asr", "m", true).contains("就绪"));
+            assert_eq!(cli_probe_duration(None), "未知");
+            assert_eq!(cli_probe_duration(Some(9.35)), "9.35 s");
+            assert_eq!(
+                cli_kv_str(CLI_KV_MEDIA_EXTS, "wav, mp4"),
+                "媒体扩展:wav, mp4"
+            );
+            assert_eq!(
+                cli_probe_failed(path, "os error 2"),
+                "读不到文件信息: C:/tmp/x（os error 2）"
+            );
+            assert_eq!(cli_events_unknown("xml"), "--events 只支持 json，收到: xml");
+        });
+        with_ui_lang(UiLang::En, || {
+            assert_eq!(cli_status_banner(), "=== OneAsr CLI · status ===");
+            assert_eq!(cli_kv(CLI_KV_VERSION, path), "version: C:/tmp/x");
+            assert_eq!(cli_can_start_line(true, None), "ready to start");
+            assert_eq!(
+                cli_can_start_line(false, Some("missing")),
+                "cannot start: missing"
+            );
+            let row = cli_model_row("asr", "m", path, true, None);
+            assert!(row.contains("ready") && row.contains("C:/tmp/x"), "{row}");
+            assert_eq!(cli_probe_duration(None), "unknown");
+            assert_eq!(
+                cli_kv_str(CLI_KV_MEDIA_EXTS, "wav, mp4"),
+                "media:   wav, mp4"
+            );
+            assert_eq!(
+                cli_events_unknown("xml"),
+                "--events only supports json, got: xml"
+            );
+        });
+    }
+
+    #[test]
+    fn cli_str_table_has_no_single_sided_entries() {
+        let table = [
+            ("CLI_KV_INPUT", CLI_KV_INPUT),
+            ("CLI_KV_APP", CLI_KV_APP),
+            ("CLI_KV_DATA", CLI_KV_DATA),
+            ("CLI_KV_ASR", CLI_KV_ASR),
+            ("CLI_KV_ALIGN", CLI_KV_ALIGN),
+            ("CLI_KV_OUTPUT", CLI_KV_OUTPUT),
+            ("CLI_KV_MODEL", CLI_KV_MODEL),
+            ("CLI_KV_TARGET", CLI_KV_TARGET),
+            ("CLI_KV_TIMELINE", CLI_KV_TIMELINE),
+            ("CLI_KV_VERSION", CLI_KV_VERSION),
+            ("CLI_KV_MODELS_ROOT", CLI_KV_MODELS_ROOT),
+            ("CLI_KV_BACKEND", CLI_KV_BACKEND),
+            ("CLI_KV_LANGUAGE", CLI_KV_LANGUAGE),
+            ("CLI_KV_UI_LANGUAGE", CLI_KV_UI_LANGUAGE),
+            ("CLI_KV_MEDIA_EXTS", CLI_KV_MEDIA_EXTS),
+            ("CLI_KV_CAN_START", CLI_KV_CAN_START),
+            ("CLI_KV_SIZE", CLI_KV_SIZE),
+            ("CLI_KV_DURATION", CLI_KV_DURATION),
+            ("CLI_KV_KIND", CLI_KV_KIND),
+            ("CLI_ASR_TEXT_BEGIN", CLI_ASR_TEXT_BEGIN),
+            ("CLI_ASR_TEXT_END", CLI_ASR_TEXT_END),
+            ("CLI_HOTWORD_INLINE", CLI_HOTWORD_INLINE),
+            ("CLI_ALIGN_HOTWORDS_IGNORED", CLI_ALIGN_HOTWORDS_IGNORED),
+            ("CLI_ALIGN_BEAUTIFY_IGNORED", CLI_ALIGN_BEAUTIFY_IGNORED),
+        ];
+        for (name, s) in table {
+            assert!(!s.zh.trim().is_empty(), "{name}: zh 侧为空");
+            assert!(!s.en.trim().is_empty(), "{name}: en 侧为空");
+        }
+    }
+}
