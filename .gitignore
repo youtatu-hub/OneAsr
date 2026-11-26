@@ -52,3 +52,5 @@ __pycache__/
 /testdata/baselines/
 /testdata/_cache/
 /testdata/_compare*/
+
+/docs/origin
